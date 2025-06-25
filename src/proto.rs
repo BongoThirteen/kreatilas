@@ -70,6 +70,7 @@ impl State {
                 }
                 if msg.hops_to_live == 1 && rng().random() {
                     if let MessageData::Insert { from, key } = msg.data {
+                        self.peers.insert(from.node_id);
                         self.transactions
                             .entry(msg.tx_id)
                             .or_insert(TxState::Inserting {
@@ -429,6 +430,7 @@ fn handle_message(
                 return;
             }
 
+            peers.insert(from.node_id);
             *tx = TxState::Inserting {
                 origin: from.clone(),
                 from: peer_id,
@@ -445,6 +447,7 @@ fn handle_message(
             from: ref download_from,
         } => match tx {
             TxState::Finding { from, key, .. } if *from != peer_id => {
+                peers.insert(download_from.node_id);
                 if *from == node_addr.node_id {
                     outbox.push(OutEvent::Found(*key));
                 } else {
@@ -460,6 +463,7 @@ fn handle_message(
                 }
             }
             TxState::Inserting { origin, key, .. } if origin.node_id != peer_id => {
+                peers.insert(download_from.node_id);
                 outbox.push(OutEvent::DownloadBlob(
                     msg.tx_id,
                     download_from.clone(),
@@ -646,9 +650,11 @@ fn handle_message(
         },
         MessageData::Ready { ref addr, data } => match tx {
             TxState::Inserting { origin, key, .. } => {
+                peers.insert(addr.node_id);
                 outbox.push(OutEvent::DownloadBlob(msg.tx_id, origin.clone(), *key));
             }
             TxState::Finding { .. } => {
+                peers.insert(addr.node_id);
                 outbox.push(OutEvent::DownloadBlob(msg.tx_id, addr.clone(), data));
             }
             _ => {
