@@ -25,17 +25,34 @@ impl Message {
             data: MessageData::Pulse,
         }
     }
+    pub fn transaction(&self) -> Uuid {
+        self.tx_id
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 enum MessageData {
-    Find { key: Hash },
-    Found { from: NodeAddr },
+    Find {
+        key: Hash,
+    },
+    Found {
+        from: NodeAddr,
+        size: u64,
+    },
     NotFound,
-    Continue { hops_remaining: u64 },
-    Insert { from: NodeAddr, key: Hash },
+    Continue {
+        hops_remaining: u64,
+    },
+    Insert {
+        from: NodeAddr,
+        key: Hash,
+    },
     Inserted,
-    Ready { addr: NodeAddr, data: Hash },
+    Ready {
+        addr: NodeAddr,
+        data: Hash,
+        size: u64,
+    },
     Pulse,
     Error,
 }
@@ -71,12 +88,12 @@ impl State {
                 if msg.hops_to_live == 1 && rng().random() {
                     if let MessageData::Insert { from, key } = msg.data {
                         self.peers.insert(from.node_id);
+                        self.outbox.push(OutEvent::PeerInfo(from.clone()));
                         self.transactions
                             .entry(msg.tx_id)
                             .or_insert(TxState::Inserting {
                                 origin: from,
                                 from: peer_id,
-                                next: None,
                                 hops_to_live: msg.hops_to_live,
                                 depth: msg.depth,
                                 key,
@@ -131,7 +148,7 @@ impl State {
                             key,
                             tried,
                         } => {
-                            if status != BlobStatus::NotFound {
+                            if let BlobStatus::Complete { size } = status {
                                 self.outbox.push(OutEvent::SendMessage(
                                     *from,
                                     Message {
@@ -140,6 +157,7 @@ impl State {
                                         depth: 0,
                                         data: MessageData::Found {
                                             from: self.node_addr.clone(),
+                                            size,
                                         },
                                     },
                                 ));
@@ -152,6 +170,7 @@ impl State {
                                         data: MessageData::Ready {
                                             addr: self.node_addr.clone(),
                                             data: *key,
+                                            size,
                                         },
                                     },
                                 ));
@@ -161,7 +180,6 @@ impl State {
                                     .iter()
                                     .find(|p| !tried.contains(*p) && *p != from)
                                 {
-                                    tried.insert(*send_to);
                                     self.outbox.push(OutEvent::SendMessage(
                                         *send_to,
                                         Message {
@@ -192,10 +210,22 @@ impl State {
                             depth,
                             key,
                             tried,
-                            next,
                             from,
                         } => {
-                            if status == BlobStatus::NotFound {
+                            if let BlobStatus::Complete { size } = status {
+                                self.outbox.push(OutEvent::SendMessage(
+                                    origin.node_id,
+                                    Message {
+                                        tx_id,
+                                        hops_to_live: *depth + 2,
+                                        depth: 0,
+                                        data: MessageData::Found {
+                                            from: self.node_addr.clone(),
+                                            size,
+                                        },
+                                    },
+                                ));
+                            } else {
                                 if let Some(send_to) = self
                                     .peers
                                     .iter()
@@ -204,8 +234,6 @@ impl State {
                                     })
                                     .min_by_key(|p| distance(**p, *key))
                                 {
-                                    tried.insert(*send_to);
-                                    *next = Some(*send_to);
                                     self.outbox.push(OutEvent::SendMessage(
                                         *send_to,
                                         Message {
@@ -231,25 +259,13 @@ impl State {
                                         },
                                     ));
                                 }
-                            } else {
-                                self.outbox.push(OutEvent::SendMessage(
-                                    origin.node_id,
-                                    Message {
-                                        tx_id,
-                                        hops_to_live: *depth + 2,
-                                        depth: 0,
-                                        data: MessageData::Found {
-                                            from: self.node_addr.clone(),
-                                        },
-                                    },
-                                ));
                             }
                         }
                         TxState::Errored { .. } | TxState::Finished { .. } => {}
                     }
                 }
             }
-            InEvent::DownloadedBlob(tx_id) => {
+            InEvent::DownloadedBlob(tx_id, size) => {
                 if let Some(tx) = self.transactions.get_mut(&tx_id) {
                     match tx {
                         TxState::Finding {
@@ -267,6 +283,7 @@ impl State {
                                         data: MessageData::Ready {
                                             addr: self.node_addr.clone(),
                                             data: *key,
+                                            size,
                                         },
                                     },
                                 ));
@@ -274,13 +291,15 @@ impl State {
                             *tx = TxState::Finished { from: *from };
                         }
                         TxState::Inserting {
-                            next,
                             from,
                             key,
                             depth,
+                            tried,
                             ..
                         } => {
-                            if let Some(next) = next {
+                            let mut sent = false;
+                            for next in tried.iter() {
+                                sent = true;
                                 self.outbox.push(OutEvent::SendMessage(
                                     *next,
                                     Message {
@@ -290,10 +309,12 @@ impl State {
                                         data: MessageData::Ready {
                                             addr: self.node_addr.clone(),
                                             data: *key,
+                                            size,
                                         },
                                     },
                                 ));
-                            } else {
+                            }
+                            if !sent {
                                 self.outbox.push(OutEvent::SendMessage(
                                     *from,
                                     Message {
@@ -301,6 +322,93 @@ impl State {
                                         hops_to_live: *depth + 2,
                                         depth: 0,
                                         data: MessageData::Inserted,
+                                    },
+                                ));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            InEvent::Timeout(tx_id, timeout_peer) => {
+                if let Some(tx) = self.transactions.get_mut(&tx_id) {
+                    match tx {
+                        TxState::Finding {
+                            from,
+                            hops_to_live,
+                            depth,
+                            key,
+                            tried,
+                        } if !tried.contains(&timeout_peer) => {
+                            if let Some(send_to) = self
+                                .peers
+                                .iter()
+                                .filter(|p| !tried.contains(*p) && *p != from)
+                                .min_by_key(|p| distance(**p, *key))
+                            {
+                                self.outbox.push(OutEvent::SendMessage(
+                                    *send_to,
+                                    Message {
+                                        tx_id,
+                                        hops_to_live: (*hops_to_live - 1).max(1),
+                                        depth: *depth + 1,
+                                        data: MessageData::Find { key: *key },
+                                    },
+                                ));
+                            } else if *from == self.node_addr.node_id {
+                                self.outbox.push(OutEvent::NotFound(*key));
+                            } else {
+                                self.outbox.push(OutEvent::SendMessage(
+                                    *from,
+                                    Message {
+                                        tx_id,
+                                        hops_to_live: *depth + 2,
+                                        depth: 0,
+                                        data: MessageData::Continue {
+                                            hops_remaining: *hops_to_live,
+                                        },
+                                    },
+                                ));
+                            }
+                        }
+                        TxState::Inserting {
+                            origin,
+                            hops_to_live,
+                            depth,
+                            key,
+                            tried,
+                            ..
+                        } if !tried.contains(&timeout_peer) => {
+                            if let Some(send_to) = self
+                                .peers
+                                .iter()
+                                .filter(|p| !tried.contains(*p) && **p != origin.node_id)
+                                .min_by_key(|p| distance(**p, *key))
+                            {
+                                self.outbox.push(OutEvent::SendMessage(
+                                    *send_to,
+                                    Message {
+                                        tx_id,
+                                        hops_to_live: *depth + 2,
+                                        depth: *depth + 1,
+                                        data: MessageData::Insert {
+                                            from: origin.clone(),
+                                            key: *key,
+                                        },
+                                    },
+                                ));
+                            } else if origin.node_id == self.node_addr.node_id {
+                                self.outbox.push(OutEvent::NotInserted(*key));
+                            } else {
+                                self.outbox.push(OutEvent::SendMessage(
+                                    origin.node_id,
+                                    Message {
+                                        tx_id,
+                                        hops_to_live: *depth + 2,
+                                        depth: 0,
+                                        data: MessageData::Continue {
+                                            hops_remaining: *hops_to_live,
+                                        },
                                     },
                                 ));
                             }
@@ -349,8 +457,7 @@ impl State {
                         hops_to_live: 2,
                         depth: 0,
                         key,
-                        tried: HashSet::from([*send_to]),
-                        next: Some(*send_to),
+                        tried: HashSet::new(),
                     },
                 );
                 self.outbox.push(OutEvent::SendMessage(
@@ -434,13 +541,13 @@ fn handle_message(
                 depth: msg.depth,
                 key,
                 tried: HashSet::new(),
-                next: None,
             };
 
             outbox.push(OutEvent::CheckBlob(msg.tx_id, key));
         }
         MessageData::Found {
             from: ref download_from,
+            size,
         } => match tx {
             TxState::Finding { from, key, .. } if *from != peer_id => {
                 peers.insert(download_from.node_id);
@@ -453,7 +560,10 @@ fn handle_message(
                             tx_id: msg.tx_id,
                             hops_to_live: (msg.hops_to_live - 1).max(1),
                             depth: msg.depth + 1,
-                            data: MessageData::Found { from: node_addr },
+                            data: MessageData::Found {
+                                from: node_addr,
+                                size,
+                            },
                         },
                     ));
                 }
@@ -464,6 +574,7 @@ fn handle_message(
                     msg.tx_id,
                     download_from.clone(),
                     *key,
+                    size,
                 ));
                 if origin.node_id == node_addr.node_id {
                     outbox.push(OutEvent::NotInserted(*key));
@@ -474,7 +585,10 @@ fn handle_message(
                             tx_id: msg.tx_id,
                             hops_to_live: (msg.hops_to_live - 1).max(1),
                             depth: msg.depth + 1,
-                            data: MessageData::Found { from: node_addr },
+                            data: MessageData::Found {
+                                from: node_addr,
+                                size,
+                            },
                         },
                     ));
                 }
@@ -503,15 +617,17 @@ fn handle_message(
             }
             TxState::Inserting {
                 origin,
-                next,
                 key,
                 from,
+                tried,
+                size,
                 ..
             } => {
+                tried.insert(peer_id);
                 if origin.node_id == node_addr.node_id {
-                    if let Some(next) = *next {
+                    for next in tried.iter() {
                         outbox.push(OutEvent::SendMessage(
-                            next,
+                            *next,
                             Message {
                                 tx_id: msg.tx_id,
                                 hops_to_live: 5,
@@ -519,6 +635,7 @@ fn handle_message(
                                 data: MessageData::Ready {
                                     addr: node_addr.clone(),
                                     data: *key,
+                                    size: *size,
                                 },
                             },
                         ));
@@ -539,7 +656,7 @@ fn handle_message(
                 send_error(peer_id, &msg, outbox);
             }
         },
-        MessageData::Continue { .. } => match tx {
+        MessageData::Continue { hops_remaining } => match tx {
             TxState::Finding {
                 from,
                 hops_to_live,
@@ -547,6 +664,7 @@ fn handle_message(
                 key,
                 tried,
             } if *from != peer_id => {
+                tried.insert(peer_id);
                 if let Some(send_to) = peers
                     .iter()
                     .filter(|p| !tried.contains(*p) && *p != from && **p != peer_id)
@@ -579,13 +697,12 @@ fn handle_message(
             }
             TxState::Inserting {
                 origin,
-                hops_to_live,
                 depth,
                 key,
                 tried,
-                next,
                 ..
             } if origin.node_id != peer_id => {
+                tried.insert(peer_id);
                 if let Some(send_to) = peers
                     .iter()
                     .filter(|p| !tried.contains(*p) && **p != origin.node_id && **p != peer_id)
@@ -595,7 +712,7 @@ fn handle_message(
                         *send_to,
                         Message {
                             tx_id: msg.tx_id,
-                            hops_to_live: (*hops_to_live - 1).max(1),
+                            hops_to_live: (hops_remaining - 1).max(1),
                             depth: *depth + 1,
                             data: MessageData::Insert {
                                 from: origin.clone(),
@@ -603,7 +720,6 @@ fn handle_message(
                             },
                         },
                     ));
-                    *next = Some(*send_to);
                 } else if origin.node_id == node_addr.node_id {
                     outbox.push(OutEvent::NotInserted(*key));
                 } else {
@@ -613,9 +729,7 @@ fn handle_message(
                             tx_id: msg.tx_id,
                             hops_to_live: (msg.hops_to_live - 1).max(1),
                             depth: msg.depth + 1,
-                            data: MessageData::Continue {
-                                hops_remaining: *hops_to_live,
-                            },
+                            data: MessageData::Continue { hops_remaining },
                         },
                     ));
                 }
@@ -644,14 +758,23 @@ fn handle_message(
                 send_error(peer_id, &msg, outbox);
             }
         },
-        MessageData::Ready { ref addr, data } => match tx {
+        MessageData::Ready {
+            ref addr,
+            data,
+            size,
+        } => match tx {
             TxState::Inserting { origin, key, .. } => {
                 peers.insert(addr.node_id);
-                outbox.push(OutEvent::DownloadBlob(msg.tx_id, origin.clone(), *key));
+                outbox.push(OutEvent::DownloadBlob(
+                    msg.tx_id,
+                    origin.clone(),
+                    *key,
+                    size,
+                ));
             }
             TxState::Finding { .. } => {
                 peers.insert(addr.node_id);
-                outbox.push(OutEvent::DownloadBlob(msg.tx_id, addr.clone(), data));
+                outbox.push(OutEvent::DownloadBlob(msg.tx_id, addr.clone(), data, size));
             }
             _ => {
                 send_error(peer_id, &msg, outbox);
@@ -684,6 +807,7 @@ fn distance(a: PublicKey, b: Hash) -> (u128, u128) {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
+    pub max_storage_use: u64,
     pub max_message_size: usize,
 }
 
@@ -691,7 +815,8 @@ pub struct Config {
 pub enum InEvent {
     RecvMessage(PublicKey, Message),
     CheckedBlob(Uuid, BlobStatus),
-    DownloadedBlob(Uuid),
+    DownloadedBlob(Uuid, u64),
+    Timeout(Uuid, PublicKey),
     Find(Hash),
     Insert(Hash),
     PeerDisconnected(PublicKey),
@@ -701,7 +826,8 @@ pub enum InEvent {
 pub enum OutEvent {
     SendMessage(PublicKey, Message),
     CheckBlob(Uuid, Hash),
-    DownloadBlob(Uuid, NodeAddr, Hash),
+    DownloadBlob(Uuid, NodeAddr, Hash, u64),
+    PeerInfo(NodeAddr),
     Found(Hash),
     Downloaded(Hash),
     NotFound(Hash),
@@ -725,10 +851,10 @@ enum TxState {
     Inserting {
         origin: NodeAddr,
         from: PublicKey,
-        next: Option<PublicKey>,
         hops_to_live: u64,
         depth: u64,
         key: Hash,
+        size: u64,
         tried: HashSet<PublicKey>,
     },
     Errored {

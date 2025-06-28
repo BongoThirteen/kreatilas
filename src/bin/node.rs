@@ -12,7 +12,8 @@ use ed25519_dalek::{
     pkcs8::{DecodePrivateKey, EncodePrivateKey, spki::der::pem::LineEnding},
 };
 use futures::StreamExt;
-use iroh::{Endpoint, NodeId, PublicKey, SecretKey, protocol::Router};
+use iroh::{Endpoint, NodeAddr, SecretKey, protocol::Router};
+use iroh_base::ticket::NodeTicket;
 use iroh_blobs::{
     export::ExportProgress,
     net_protocol::Blobs,
@@ -86,13 +87,25 @@ async fn main() -> anyhow::Result<()> {
 
     let blobs_client = blobs.client();
 
-    let node_id = endpoint.node_id();
+    let node_addr = endpoint.node_addr().await?;
+    let node_id = node_addr.node_id;
+    let node_ticket = NodeTicket::new(iroh_base::NodeAddr {
+        node_id: iroh_base::PublicKey::try_from(node_id.as_bytes())
+            .expect("I know this is a valid key"),
+        relay_url: node_addr.relay_url.as_deref().cloned().map(Into::into),
+        direct_addresses: node_addr.direct_addresses,
+    });
     let router = Router::builder(endpoint)
         .accept(b"librorum/1", handler.clone())
         .accept(iroh_blobs::ALPN, blobs.clone())
         .spawn();
 
-    println!("{}{}", "You are node ".white(), node_id.to_string().green());
+    println!(
+        "{}{}\n\nUse `{}` to connect\n",
+        "You are node ".white(),
+        node_id.to_string().green(),
+        format!("peer {node_ticket}").green()
+    );
 
     let commands = vec!["get".into(), "put".into(), "list".into(), "peer".into()];
     let completer = Box::new(DefaultCompleter::new_with_wordlen(commands.clone(), 2));
@@ -303,7 +316,7 @@ async fn main() -> anyhow::Result<()> {
                             continue;
                         };
 
-                        let peer_id: NodeId = match peer_id.parse() {
+                        let peer_id: NodeTicket = match peer_id.parse() {
                             Ok(key) => key,
                             Err(err) => {
                                 error(&format!(
@@ -314,7 +327,29 @@ async fn main() -> anyhow::Result<()> {
                             }
                         };
 
-                        handler.add_peer(peer_id).await;
+                        let peer_id = iroh_base::NodeAddr::from(peer_id);
+
+                        if let Err(err) = handler
+                            .add_peer(NodeAddr::from_parts(
+                                peer_id
+                                    .node_id
+                                    .as_bytes()
+                                    .try_into()
+                                    .expect("I know these keys are compatible"),
+                                peer_id.relay_url.as_deref().cloned().map(Into::into),
+                                peer_id.direct_addresses,
+                            ))
+                            .await
+                        {
+                            error(&format!("failed to add peer {}", format!("({err})").red()));
+                            continue;
+                        }
+
+                        println!(
+                            "\n{}{}",
+                            "Added peer ".white(),
+                            peer_id.node_id.fmt_short().green()
+                        );
                     }
                     "list" => {
                         let mut listing = match blobs_client.list().await {
@@ -338,6 +373,31 @@ async fn main() -> anyhow::Result<()> {
                                 "Blob {} {}",
                                 entry.hash.to_hex().green(),
                                 format!("({} bytes)", entry.size).white(),
+                            );
+                        }
+                    }
+                    "tags" => {
+                        let mut listing = match blobs_client.tags().list().await {
+                            Ok(listing) => listing,
+                            Err(err) => {
+                                error(&err.to_string());
+                                continue;
+                            }
+                        };
+
+                        while let Some(entry) = listing.next().await {
+                            let entry = match entry {
+                                Ok(entry) => entry,
+                                Err(err) => {
+                                    error(&err.to_string());
+                                    continue;
+                                }
+                            };
+
+                            println!(
+                                "Tag {} {}",
+                                entry.name.to_string().green(),
+                                format!("({})", entry.hash).white()
                             );
                         }
                     }
@@ -389,7 +449,7 @@ impl Highlighter for NodeHighlighter {
                     return text;
                 };
 
-                let Ok(_id) = node_id.trim().parse::<PublicKey>() else {
+                let Ok(_id) = node_id.trim().parse::<NodeTicket>() else {
                     text.push((Style::new().fg(Color::Red), node_id.to_string()));
                     for word in words {
                         text.push((Style::new().fg(Color::Red), word.to_string()));

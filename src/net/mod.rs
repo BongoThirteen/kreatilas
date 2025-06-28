@@ -4,6 +4,7 @@ use std::{
     mem,
     pin::Pin,
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::Context;
@@ -13,6 +14,7 @@ use iroh::{
     Endpoint, NodeAddr, NodeId, PublicKey, endpoint::Connection, protocol::ProtocolHandler,
 };
 use iroh_blobs::{net_protocol::Blobs, rpc::client::blobs::MemClient, store::Store};
+use iroh_gossip::net::util::Timers;
 use n0_future::{
     task::{AbortOnDropHandle, JoinSet},
     time::Instant,
@@ -27,6 +29,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
+use uuid::Uuid;
 use writer::write_message;
 
 use crate::proto::{Config, InEvent, Message, OutEvent, State};
@@ -44,6 +47,7 @@ impl Handler {
         let node_addr = endpoint.node_addr().await?;
         let blobs_client = blobs.client().clone();
         let config = Config {
+            max_storage_use: 16 * 1024 * 1024,
             max_message_size: 65536,
         };
 
@@ -65,32 +69,35 @@ impl Handler {
 
     pub async fn get(&self, key: Hash) -> anyhow::Result<bool> {
         let (send, recv) = oneshot::channel();
-        _ = self
-            .inner
+        self.inner
             .to_actor_tx
             .send(ToActor::Get { key, result: send })
-            .await;
+            .await?;
         let res = recv.await?;
         Ok(res)
     }
 
     pub async fn put(&self, key: Hash) -> anyhow::Result<bool> {
         let (send, recv) = oneshot::channel();
-        _ = self
-            .inner
+        self.inner
             .to_actor_tx
             .send(ToActor::Put { key, result: send })
-            .await;
+            .await?;
         let res = recv.await?;
         Ok(res)
     }
 
-    pub async fn add_peer(&self, node_id: NodeId) {
-        _ = self
-            .inner
+    pub async fn add_peer(&self, node_addr: NodeAddr) -> anyhow::Result<()> {
+        let (send, recv) = oneshot::channel();
+        self.inner
             .to_actor_tx
-            .send(ToActor::AddPeer { node_id })
-            .await;
+            .send(ToActor::AddPeer {
+                node_addr,
+                result: send,
+            })
+            .await?;
+        let res = recv.await?;
+        Ok(res)
     }
 }
 
@@ -114,7 +121,9 @@ enum ToActor {
         result: oneshot::Sender<bool>,
     },
     AddPeer {
-        node_id: NodeId,
+        node_addr: NodeAddr,
+        #[debug("Sender")]
+        result: oneshot::Sender<()>,
     },
 }
 
@@ -128,6 +137,7 @@ struct Actor {
     in_event_rx: Receiver<InEvent>,
     results: HashMap<Hash, oneshot::Sender<bool>>,
     peers: HashMap<NodeId, PeerState>,
+    timers: Timers<(Uuid, PublicKey)>,
     connection_tasks: JoinSet<(NodeId, Connection, anyhow::Result<()>)>,
 }
 
@@ -152,6 +162,7 @@ impl Actor {
             in_event_rx,
             results: HashMap::new(),
             peers: HashMap::new(),
+            timers: Timers::default(),
             connection_tasks: JoinSet::default(),
         };
 
@@ -181,15 +192,19 @@ impl Actor {
                         self.results.insert(key, result);
                         self.handle_in_event(InEvent::Find(key), Instant::now()).await?;
                     }
-                    Some(ToActor::AddPeer { node_id }) => {
-                        self.state.add_peer(node_id);
-                        let state = self.peers.entry(node_id).or_default();
+                    Some(ToActor::AddPeer { node_addr, result }) => {
+                        self.state.add_peer(node_addr.node_id);
+                        let state = self.peers.entry(node_addr.node_id).or_default();
                         match state {
                             PeerState::Active { .. } => {
                             }
                             PeerState::Pending { queue } => {
                                 if queue.is_empty() {
-                                    self.dialer.queue_dial(node_id, b"librorum/1");
+                                    let node_id = node_addr.node_id;
+                                    if let Err(err) = self.dialer.endpoint.add_node_addr(node_addr) {
+                                        warn!(%err, "failed to add node address");
+                                    }
+                                    self.dialer.queue_dial(node_id, b"librorum/1", Some(result));
                                 }
                                 queue.push(Message::pulse());
                             }
@@ -213,6 +228,12 @@ impl Actor {
             in_event = self.in_event_rx.recv() => {
                 let in_event = in_event.expect("in_event_tx is never dropped before receiver");
                 self.handle_in_event(in_event, Instant::now()).await?;
+            }
+            timers = self.timers.wait_and_drain() => {
+                let now = Instant::now();
+                for (_instant, (tx_id, peer_id)) in timers {
+                    self.handle_in_event(InEvent::Timeout(tx_id, peer_id), now).await?;
+                }
             }
             Some(res) = self.connection_tasks.join_next(), if !self.connection_tasks.is_empty() => {
                 let (peer_id, conn, res) = res.expect("connection task panicked");
@@ -292,6 +313,10 @@ impl Actor {
             debug!(?event, "handling output event");
             match event {
                 OutEvent::SendMessage(peer_id, msg) => {
+                    self.timers.insert(
+                        Instant::now() + Duration::from_secs(3),
+                        (msg.transaction(), peer_id),
+                    );
                     let state = self.peers.entry(peer_id).or_default();
                     match state {
                         PeerState::Active { send_tx, .. } => {
@@ -301,7 +326,7 @@ impl Actor {
                         }
                         PeerState::Pending { queue } => {
                             if queue.is_empty() {
-                                self.dialer.queue_dial(peer_id, b"librorum/1");
+                                self.dialer.queue_dial(peer_id, b"librorum/1", None);
                             }
                             queue.push(msg);
                         }
@@ -316,8 +341,9 @@ impl Actor {
                         }
                     });
                 }
-                OutEvent::DownloadBlob(tx_id, from, key) => {
+                OutEvent::DownloadBlob(tx_id, from, key, size) => {
                     let client = self.blobs_client.clone();
+                    let max_storage_use = self.state.config.max_storage_use;
                     let in_event_tx = self.in_event_tx.clone();
                     spawn(async move {
                         let progress = match client.download(key.into(), from).await {
@@ -339,6 +365,11 @@ impl Actor {
                             warn!(%err, "failed to send download notification");
                         }
                     });
+                }
+                OutEvent::PeerInfo(info) => {
+                    if let Err(err) = self.dialer.endpoint.add_node_addr(info) {
+                        warn!(%err, "failed to add node address");
+                    }
                 }
                 OutEvent::Downloaded(key) | OutEvent::Inserted(key) => {
                     if let Some(res) = self.results.remove(&key) {
@@ -375,7 +406,12 @@ impl Dialer {
             pending_dials: HashMap::new(),
         }
     }
-    fn queue_dial(&mut self, node_id: NodeId, alpn: &'static [u8]) {
+    fn queue_dial(
+        &mut self,
+        node_id: NodeId,
+        alpn: &'static [u8],
+        result: Option<oneshot::Sender<()>>,
+    ) {
         if self.is_pending(node_id) {
             return;
         }
@@ -386,7 +422,12 @@ impl Dialer {
             let res = select! {
                 biased;
                 _ = cancel.cancelled() => None,
-                res = endpoint.connect(node_id, alpn) => Some(res.context("failed to dial")),
+                res = endpoint.connect(node_id, alpn) => {
+                    if let Some(send) = result {
+                        _ = send.send(());
+                    }
+                    Some(res.context("failed to dial"))
+                }
             };
             (node_id, res)
         });

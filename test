@@ -1,0 +1,66 @@
+┌─╴Cmd
+  |Sort
+  |Groups
+  |Members [G]
+  |List [F]
+  |Add {G F C}
+  |Del [F]
+  Cli ← (
+    ⍣(⍩(⋅Sort) °(⊂□"sort")
+    | ⍩(⋅Groups) °(⊂□"groups")
+    | ⍩(Members⊢) °(⊂□"members")
+    | ⍩(List⊢) °(⊂□"list")
+    | ⍩(Add°{⊙⊙∘}) °(⊂□"add")
+    | ⍩(Del⊢) °(⊂□"del")
+    | ⍩(⍤"Unknown command"⋅0) ⊢
+    | ⍩(⍤"No command provided"⋅0)
+    ) ↘1 &args)
+└─╴
+┌─╴Friend
+  ~ {G N C}
+  Header ↚ {"Group name" "Friend name" "Contact info"}
+  Load ← (
+    °csv &fras "friendgroups.csv"
+    °(⊂Header)
+    ≡(Friend°{⊙⊙∘})
+  )
+  Store ← (
+    &fwa "friendgroups.csv" csv⊂Header
+  )
+└─╴
+
+Cmd~Cli
+
+⍣(⍩(
+    Friend~Load
+    ⍆
+    Friend~Store
+  ) °Cmd~Sort
+| ⍩(
+    Friend~Load
+    ◴≡Friend~G
+    &p $"_\n_"
+  ) °Cmd~Groups
+| ⍩(
+    Friend~Load
+    ⤚(≡≍⍚Friend~G)
+    ▽
+    &s
+  ) °Cmd~Members
+| ⍩(
+    Friend~Load
+    ⊢▽⤚(≡≍⍚Friend~N)
+    $"Name: _\nGroup: _\nContact: _": °Friend
+    &p
+  ) °Cmd~List
+| ⍩(
+    Friend ∩₃°□
+    ⊂Friend~Load
+    Friend~Store
+  ) °Cmd~Add
+| ⍩(
+    Friend~Load
+    ▽⤚(¬≡≍⍚Friend~N)
+    Friend~Store
+  ) °Cmd~Del
+)
