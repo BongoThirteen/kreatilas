@@ -202,7 +202,7 @@ impl State {
                                     .filter(|p| {
                                         !tried.contains(*p) && **p != origin.node_id && *p != from
                                     })
-                                    .min_by_key(|p| distance(**p, self.node_addr.node_id))
+                                    .min_by_key(|p| distance(**p, *key))
                                 {
                                     tried.insert(*send_to);
                                     *next = Some(*send_to);
@@ -336,11 +336,7 @@ impl State {
                 ));
             }
             InEvent::Insert(key) => 'inserting: {
-                let Some(send_to) = self
-                    .peers
-                    .iter()
-                    .min_by_key(|p| distance(**p, self.node_addr.node_id))
-                else {
+                let Some(send_to) = self.peers.iter().min_by_key(|p| distance(**p, key)) else {
                     self.outbox.push(OutEvent::NotInserted(key));
                     break 'inserting;
                 };
@@ -554,7 +550,7 @@ fn handle_message(
                 if let Some(send_to) = peers
                     .iter()
                     .filter(|p| !tried.contains(*p) && *p != from && **p != peer_id)
-                    .min_by_key(|p| distance(**p, node_addr.node_id))
+                    .min_by_key(|p| distance(**p, *key))
                 {
                     outbox.push(OutEvent::SendMessage(
                         *send_to,
@@ -593,7 +589,7 @@ fn handle_message(
                 if let Some(send_to) = peers
                     .iter()
                     .filter(|p| !tried.contains(*p) && **p != origin.node_id && **p != peer_id)
-                    .min_by_key(|p| distance(**p, node_addr.node_id))
+                    .min_by_key(|p| distance(**p, *key))
                 {
                     outbox.push(OutEvent::SendMessage(
                         *send_to,
@@ -669,7 +665,7 @@ fn handle_message(
     }
 }
 
-fn distance(a: PublicKey, b: PublicKey) -> (u128, u128) {
+fn distance(a: PublicKey, b: Hash) -> (u128, u128) {
     let (a1, a2) = (
         u128::from_be_bytes(a.as_bytes()[..16].try_into().unwrap()),
         u128::from_be_bytes(a.as_bytes()[16..].try_into().unwrap()),

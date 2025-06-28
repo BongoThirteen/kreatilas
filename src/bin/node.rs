@@ -399,14 +399,6 @@ impl Highlighter for NodeHighlighter {
 
                 text.push((Style::new().fg(Color::Green), node_id.to_string()));
 
-                if let Some(maybe_local) = words.next().as_deref() {
-                    if maybe_local.trim() == "local" {
-                        text.push((Style::new().fg(Color::Green), maybe_local.to_string()));
-                    } else {
-                        text.push((Style::new().fg(Color::Red), maybe_local.to_string()));
-                    }
-                }
-
                 for word in words {
                     text.push((Style::new().fg(Color::Red), word.to_string()));
                 }
@@ -443,6 +435,14 @@ impl Highlighter for NodeHighlighter {
                     text.push((Style::new().fg(Color::Green), path.to_string()));
                 } else {
                     text.push((Style::new().fg(Color::Red), path.to_string()));
+                }
+
+                if let Some(maybe_local) = words.next().as_deref() {
+                    if maybe_local.trim() == "local" {
+                        text.push((Style::new().fg(Color::Yellow), maybe_local.to_string()));
+                    } else {
+                        text.push((Style::new().fg(Color::Red), maybe_local.to_string()));
+                    }
                 }
 
                 for word in words {
