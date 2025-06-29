@@ -2262,6 +2262,7 @@ dependencies = [
  "bincode",
  "blake3",
  "bytes",
+ "chrono",
  "clap",
  "colored",
  "derive_more 2.0.1",

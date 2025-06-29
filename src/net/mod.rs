@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, hash_map::Entry},
+    collections::{BTreeMap, HashMap, hash_map::Entry},
     future::pending,
     mem,
     pin::Pin,
@@ -10,10 +10,16 @@ use std::{
 use anyhow::Context;
 use blake3::Hash;
 use bytes::BytesMut;
+use chrono::DateTime;
+use futures::StreamExt;
 use iroh::{
     Endpoint, NodeAddr, NodeId, PublicKey, endpoint::Connection, protocol::ProtocolHandler,
 };
-use iroh_blobs::{net_protocol::Blobs, rpc::client::blobs::MemClient, store::Store};
+use iroh_blobs::{
+    net_protocol::Blobs,
+    rpc::client::blobs::{BlobStatus, MemClient},
+    store::Store,
+};
 use iroh_gossip::net::util::Timers;
 use n0_future::{
     task::{AbortOnDropHandle, JoinSet},
@@ -47,7 +53,7 @@ impl Handler {
         let node_addr = endpoint.node_addr().await?;
         let blobs_client = blobs.client().clone();
         let config = Config {
-            max_storage_use: 16 * 1024 * 1024,
+            max_storage_use: 2000,
             max_message_size: 65536,
         };
 
@@ -185,8 +191,12 @@ impl Actor {
                         self.handle_connection(node_id, conn, origin).await;
                     }
                     Some(ToActor::Put { key, result }) => {
-                        self.results.insert(key, result);
-                        self.handle_in_event(InEvent::Insert(key), Instant::now()).await?;
+                        if let BlobStatus::Complete { size } = self.blobs_client.status(key.into()).await? {
+                            self.results.insert(key, result);
+                            self.handle_in_event(InEvent::Insert(key, size), Instant::now()).await?;
+                        } else {
+                            _ = result.send(false);
+                        }
                     }
                     Some(ToActor::Get { key, result }) => {
                         self.results.insert(key, result);
@@ -308,6 +318,7 @@ impl Actor {
     }
     async fn handle_in_event(&mut self, event: InEvent, now: Instant) -> anyhow::Result<()> {
         debug!(?event, "handling input event");
+        let max_storage_use = self.state.config.max_storage_use;
         let out = self.state.handle(event, now);
         for event in out {
             debug!(?event, "handling output event");
@@ -343,9 +354,74 @@ impl Actor {
                 }
                 OutEvent::DownloadBlob(tx_id, from, key, size) => {
                     let client = self.blobs_client.clone();
-                    let max_storage_use = self.state.config.max_storage_use;
                     let in_event_tx = self.in_event_tx.clone();
                     spawn(async move {
+                        let mut listing = match client.list().await {
+                            Ok(listing) => listing,
+                            Err(err) => {
+                                warn!(%err, "failed to list blobs");
+                                return;
+                            }
+                        };
+                        let mut storage_use = 0;
+                        let mut sizes = HashMap::new();
+
+                        while let Some(info) = listing.next().await {
+                            if let Ok(info) = info {
+                                storage_use += info.size;
+                                sizes.insert(info.hash, info.size);
+                            }
+                        }
+
+                        if storage_use + size > max_storage_use {
+                            let to_reclaim = storage_use + size - max_storage_use;
+                            let mut reclaimed = 0;
+
+                            let mut listing = match client.tags().list().await {
+                                Ok(listing) => listing,
+                                Err(err) => {
+                                    warn!(%err, "failed to list tags");
+                                    return;
+                                }
+                            };
+
+                            let mut tags = BTreeMap::new();
+                            while let Some(tag) = listing.next().await {
+                                let tag = match tag {
+                                    Ok(tag) => tag,
+                                    Err(err) => {
+                                        warn!(%err, "failed to list tags");
+                                        return;
+                                    }
+                                };
+
+                                if let Some(time) =
+                                    std::str::from_utf8(&tag.name.0).ok().and_then(|t| {
+                                        DateTime::parse_from_rfc3339(t.trim_start_matches("auto-"))
+                                            .ok()
+                                    })
+                                {
+                                    if let Some(size) = sizes.get(&tag.hash) {
+                                        tags.insert(time, (tag.hash, *size));
+                                    }
+                                }
+                            }
+
+                            while reclaimed < to_reclaim {
+                                let Some((_time, (hash, size))) = tags.pop_first() else {
+                                    warn!("not enough storage");
+                                    return;
+                                };
+
+                                if let Err(err) = client.delete_blob(hash).await {
+                                    warn!(%err, "failed to delete blob");
+                                    return;
+                                }
+
+                                reclaimed += size;
+                            }
+                        }
+
                         let progress = match client.download(key.into(), from).await {
                             Ok(progress) => progress,
                             Err(err) => {
@@ -361,7 +437,10 @@ impl Actor {
                             }
                         };
                         debug!(?outcome, "download concluded");
-                        if let Err(err) = in_event_tx.send(InEvent::DownloadedBlob(tx_id)).await {
+                        if let Err(err) = in_event_tx
+                            .send(InEvent::DownloadedBlob(tx_id, outcome.local_size))
+                            .await
+                        {
                             warn!(%err, "failed to send download notification");
                         }
                     });

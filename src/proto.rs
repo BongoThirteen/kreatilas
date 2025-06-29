@@ -46,6 +46,7 @@ enum MessageData {
     Insert {
         from: NodeAddr,
         key: Hash,
+        size: u64,
     },
     Inserted,
     Ready {
@@ -86,7 +87,7 @@ impl State {
                     break 'handling;
                 }
                 if msg.hops_to_live == 1 && rng().random() {
-                    if let MessageData::Insert { from, key } = msg.data {
+                    if let MessageData::Insert { from, key, size } = msg.data {
                         self.peers.insert(from.node_id);
                         self.outbox.push(OutEvent::PeerInfo(from.clone()));
                         self.transactions
@@ -97,6 +98,7 @@ impl State {
                                 hops_to_live: msg.hops_to_live,
                                 depth: msg.depth,
                                 key,
+                                size,
                                 tried: HashSet::new(),
                             });
                     }
@@ -209,6 +211,7 @@ impl State {
                             hops_to_live,
                             depth,
                             key,
+                            size,
                             tried,
                             from,
                         } => {
@@ -243,6 +246,7 @@ impl State {
                                             data: MessageData::Insert {
                                                 from: origin.clone(),
                                                 key: *key,
+                                                size: *size,
                                             },
                                         },
                                     ));
@@ -376,6 +380,7 @@ impl State {
                             hops_to_live,
                             depth,
                             key,
+                            size,
                             tried,
                             ..
                         } if !tried.contains(&timeout_peer) => {
@@ -394,6 +399,7 @@ impl State {
                                         data: MessageData::Insert {
                                             from: origin.clone(),
                                             key: *key,
+                                            size: *size,
                                         },
                                     },
                                 ));
@@ -443,7 +449,7 @@ impl State {
                     },
                 ));
             }
-            InEvent::Insert(key) => 'inserting: {
+            InEvent::Insert(key, size) => 'inserting: {
                 let Some(send_to) = self.peers.iter().min_by_key(|p| distance(**p, key)) else {
                     self.outbox.push(OutEvent::NotInserted(key));
                     break 'inserting;
@@ -457,6 +463,7 @@ impl State {
                         hops_to_live: 2,
                         depth: 0,
                         key,
+                        size,
                         tried: HashSet::new(),
                     },
                 );
@@ -469,6 +476,7 @@ impl State {
                         data: MessageData::Insert {
                             from: self.node_addr.clone(),
                             key,
+                            size,
                         },
                     },
                 ));
@@ -526,7 +534,11 @@ fn handle_message(
 
             outbox.push(OutEvent::CheckBlob(msg.tx_id, key));
         }
-        MessageData::Insert { ref from, key } => {
+        MessageData::Insert {
+            ref from,
+            key,
+            size,
+        } => {
             if !matches!(tx, TxState::Starting { .. }) {
                 *tx = TxState::Errored { from: peer_id };
                 send_error(peer_id, &msg, outbox);
@@ -540,6 +552,7 @@ fn handle_message(
                 hops_to_live: msg.hops_to_live,
                 depth: msg.depth,
                 key,
+                size,
                 tried: HashSet::new(),
             };
 
@@ -699,6 +712,7 @@ fn handle_message(
                 origin,
                 depth,
                 key,
+                size,
                 tried,
                 ..
             } if origin.node_id != peer_id => {
@@ -717,6 +731,7 @@ fn handle_message(
                             data: MessageData::Insert {
                                 from: origin.clone(),
                                 key: *key,
+                                size: *size,
                             },
                         },
                     ));
@@ -818,7 +833,7 @@ pub enum InEvent {
     DownloadedBlob(Uuid, u64),
     Timeout(Uuid, PublicKey),
     Find(Hash),
-    Insert(Hash),
+    Insert(Hash, u64),
     PeerDisconnected(PublicKey),
 }
 
