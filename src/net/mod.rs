@@ -43,19 +43,46 @@ use crate::proto::{Config, InEvent, Message, OutEvent, State};
 mod reader;
 mod writer;
 
+pub const KREATILAS_ALPN: &[u8] = b"/kreatilas/1";
+
 #[derive(Debug, Clone)]
-pub struct Handler {
+pub struct Kreatilas {
     inner: Arc<Inner>,
 }
 
-impl Handler {
-    pub async fn spawn<S: Store>(endpoint: Endpoint, blobs: &Blobs<S>) -> anyhow::Result<Self> {
+#[derive(Debug, Clone)]
+pub struct Builder {
+    config: Config,
+}
+
+impl Default for Builder {
+    fn default() -> Self {
+        Self {
+            config: Config {
+                max_storage_use: 100 * 1024 * 1024,
+                max_message_size: 65536,
+            },
+        }
+    }
+}
+
+impl Builder {
+    pub fn max_message_size(mut self, size: usize) -> Self {
+        self.config.max_message_size = size;
+        self
+    }
+    pub fn max_storage_use(mut self, size: u64) -> Self {
+        self.config.max_storage_use = size;
+        self
+    }
+    pub async fn spawn<S: Store>(
+        self,
+        endpoint: Endpoint,
+        blobs: &Blobs<S>,
+    ) -> anyhow::Result<Kreatilas> {
         let node_addr = endpoint.node_addr().await?;
         let blobs_client = blobs.client().clone();
-        let config = Config {
-            max_storage_use: 2000,
-            max_message_size: 65536,
-        };
+        let config = self.config;
 
         let (actor, to_actor_tx) = Actor::new(endpoint, node_addr, blobs_client, config).await;
         let actor_handle = spawn(async move {
@@ -68,11 +95,16 @@ impl Handler {
             _actor_handle,
         };
 
-        Ok(Self {
+        Ok(Kreatilas {
             inner: Arc::new(inner),
         })
     }
+}
 
+impl Kreatilas {
+    pub fn builder() -> Builder {
+        Builder::default()
+    }
     pub async fn get(&self, key: Hash) -> anyhow::Result<bool> {
         let (send, recv) = oneshot::channel();
         self.inner
@@ -214,7 +246,7 @@ impl Actor {
                                     if let Err(err) = self.dialer.endpoint.add_node_addr(node_addr) {
                                         warn!(%err, "failed to add node address");
                                     }
-                                    self.dialer.queue_dial(node_id, b"librorum/1", Some(result));
+                                    self.dialer.queue_dial(node_id, KREATILAS_ALPN, Some(result));
                                 }
                                 queue.push(Message::pulse());
                             }
@@ -337,7 +369,7 @@ impl Actor {
                         }
                         PeerState::Pending { queue } => {
                             if queue.is_empty() {
-                                self.dialer.queue_dial(peer_id, b"librorum/1", None);
+                                self.dialer.queue_dial(peer_id, KREATILAS_ALPN, None);
                             }
                             queue.push(msg);
                         }
@@ -645,7 +677,7 @@ impl Inner {
     }
 }
 
-impl ProtocolHandler for Handler {
+impl ProtocolHandler for Kreatilas {
     fn accept(
         &self,
         conn: Connection,
