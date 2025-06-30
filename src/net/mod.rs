@@ -43,13 +43,29 @@ use crate::proto::{Config, InEvent, Message, OutEvent, State};
 mod reader;
 mod writer;
 
+/// Application level protocol name (ALPN) for this protocol
 pub const KREATILAS_ALPN: &[u8] = b"/kreatilas/1";
 
+/// Deniably get and put data blobs on a peer-to-peer network.
+///
+/// When you construct an instance of `Kreatilas`, you must provide an instance of [`Blobs`].
+/// To insert data to the network, first add it to your local [`Blobs`] instance. Then, call
+/// [`put`](Self::put) with the hash of the data returned from [`Blobs`].
+///
+/// To get data, you must know its BLAKE3 hash. Supply this hash to the [`get`](Self::get) method and the
+/// data will be downloaded to your local blob store, if it can be found.
+///
+/// When constructing an instance of `Kreatilas` using a [`Builder`] you may specify the maximum local storage it is
+/// allowed to use (by default, 100 MiB).
+///
+/// `Kreatilas` does not accept connections on its own, even though you supply an [`Endpoint`] instance.
+/// You have to run your own accept loop, probably using [`Router`](iroh::protocol::Router).
 #[derive(Debug, Clone)]
 pub struct Kreatilas {
     inner: Arc<Inner>,
 }
 
+/// Builder to configure and construct [`Kreatilas`].
 #[derive(Debug, Clone)]
 pub struct Builder {
     config: Config,
@@ -67,14 +83,25 @@ impl Default for Builder {
 }
 
 impl Builder {
+    /// Sets the maximum message size in bytes.
+    /// By default this is `65536` bytes.
+    ///
+    /// Note that blob data is sent separately, so these messages are only metadata and should
+    /// be small.
     pub fn max_message_size(mut self, size: usize) -> Self {
         self.config.max_message_size = size;
         self
     }
+    /// Sets the maximum amount of local storage this instance of [`Kreatilas`] will use.
+    /// The least-recently used blobs will be deleted from the store automatically when
+    /// this limit is reached.
+    ///
+    /// By default this is 100 MiB.
     pub fn max_storage_use(mut self, size: u64) -> Self {
         self.config.max_storage_use = size;
         self
     }
+    /// Spawn an actor and get a handle to it.
     pub async fn spawn<S: Store>(
         self,
         endpoint: Endpoint,
@@ -102,9 +129,13 @@ impl Builder {
 }
 
 impl Kreatilas {
+    /// Creates [`Builder`] with the default configuration.
     pub fn builder() -> Builder {
         Builder::default()
     }
+    /// Attempts to retrieve a piece of data, identified by its BLAKE3 hash, from this peer's
+    /// network. Returns `Ok(true)` if the data was retrieved and stored in the blobs instance
+    /// supplied to [`Builder::spawn`], or `Ok(false)` otherwise.
     pub async fn get(&self, key: Hash) -> anyhow::Result<bool> {
         let (send, recv) = oneshot::channel();
         self.inner
@@ -115,6 +146,9 @@ impl Kreatilas {
         Ok(res)
     }
 
+    /// Attempts to insert a piece of data, stored in this `Kreatilas` instance's associated `Blobs`
+    /// instance and identified by its BLAKE3 hash, into this peer's network. Returns `Ok(true)` if
+    /// the data was inserted into the required number of peers, or `Ok(false)` otherwise.
     pub async fn put(&self, key: Hash) -> anyhow::Result<bool> {
         let (send, recv) = oneshot::channel();
         self.inner
@@ -125,6 +159,7 @@ impl Kreatilas {
         Ok(res)
     }
 
+    /// Notifies this peer about another peer. This is required in order to join a network.
     pub async fn add_peer(&self, node_addr: NodeAddr) -> anyhow::Result<()> {
         let (send, recv) = oneshot::channel();
         self.inner

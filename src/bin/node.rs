@@ -22,7 +22,7 @@ use iroh_blobs::{
     store::{ExportFormat, ExportMode},
     util::SetTagOption,
 };
-use kreatilas::net::Handler;
+use kreatilas::net::Kreatilas;
 use nu_ansi_term::{Color, Style};
 use rand_core::OsRng;
 use reedline::{
@@ -81,7 +81,8 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("failed to bind endpoint")?;
     let blobs = Blobs::memory().build(&endpoint);
-    let handler = Handler::spawn(endpoint.clone(), &blobs)
+    let handler = Kreatilas::builder()
+        .spawn(endpoint.clone(), &blobs)
         .await
         .context("failed to spawn handler")?;
 
@@ -96,7 +97,7 @@ async fn main() -> anyhow::Result<()> {
         direct_addresses: node_addr.direct_addresses,
     });
     let router = Router::builder(endpoint)
-        .accept(b"librorum/1", handler.clone())
+        .accept(kreatilas::ALPN, handler.clone())
         .accept(iroh_blobs::ALPN, blobs.clone())
         .spawn();
 
@@ -111,7 +112,7 @@ async fn main() -> anyhow::Result<()> {
     let completer = Box::new(DefaultCompleter::new_with_wordlen(commands.clone(), 2));
     let prompt = DefaultPrompt::new(DefaultPromptSegment::Empty, DefaultPromptSegment::Empty);
     let file_prompt = DefaultPrompt::new(
-        DefaultPromptSegment::Basic("File path".into()),
+        DefaultPromptSegment::Basic(" path ".into()),
         DefaultPromptSegment::Empty,
     );
     let mut file_editor = Reedline::create();

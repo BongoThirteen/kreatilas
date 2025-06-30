@@ -4,6 +4,8 @@ use tokio::io::AsyncRead;
 
 use crate::proto::Message;
 
+/// Read a length-prefixed message of at most `max_message_size` bytes from `reader` into
+/// `buffer`.
 pub async fn read_message(
     reader: impl AsyncRead + Unpin,
     buffer: &mut BytesMut,

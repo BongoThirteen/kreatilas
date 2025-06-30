@@ -8,15 +8,22 @@ use rand::{Rng, rng};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Protocol message
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Message {
+    /// [`Uuid`] associated with this transaction.
     tx_id: Uuid,
+    /// Approximate number of hops that this message will still travel.
     hops_to_live: u64,
+    /// Approximate number of nodes which have already relayed this message.
     depth: u64,
+    /// Message payload
     data: MessageData,
 }
 
 impl Message {
+    /// Message that does nothing but notifies the receiving node that this connection
+    /// is still active.
     pub fn pulse() -> Self {
         Self {
             tx_id: Uuid::new_v4(),
@@ -25,39 +32,45 @@ impl Message {
             data: MessageData::Pulse,
         }
     }
+    /// The transaction ID of this message.
     pub fn transaction(&self) -> Uuid {
         self.tx_id
     }
 }
 
+/// Payload of a message
 #[derive(Debug, Clone, Deserialize, Serialize)]
 enum MessageData {
-    Find {
-        key: Hash,
-    },
-    Found {
-        from: NodeAddr,
-        size: u64,
-    },
+    /// This node is looking for `key`.
+    Find { key: Hash },
+    /// This node found data at node `from` of `size` bytes.
+    Found { from: NodeAddr, size: u64 },
+    /// The [`MessageData::Find`] or [`MessageData::Insert`] message used up all its `hops_to_live`
+    /// without finding a corresponding data blob.
     NotFound,
-    Continue {
-        hops_remaining: u64,
-    },
+    /// No more nodes are available.
+    Continue { hops_remaining: u64 },
+    /// This node wants to insert some data into the network.
     Insert {
         from: NodeAddr,
         key: Hash,
         size: u64,
     },
+    /// We've traversed enough nodes and not found a colliding blob.
     Inserted,
+    /// `from` has the blob associated with `hash` of `size` bytes.
     Ready {
         addr: NodeAddr,
         data: Hash,
         size: u64,
     },
+    /// This connection is active.
     Pulse,
+    /// You sent an incorrect message.
     Error,
 }
 
+/// Node state
 #[derive(Debug, Clone)]
 pub struct State {
     pub config: Config,
@@ -68,6 +81,7 @@ pub struct State {
 }
 
 impl State {
+    /// Constructs the initial state of a new node.
     pub fn new(config: Config, node_addr: NodeAddr) -> Self {
         Self {
             config,
@@ -77,9 +91,12 @@ impl State {
             outbox: Vec::new(),
         }
     }
+    /// Add a peer's public key to this node's state. You should already have some way to
+    /// contact this peer if sent an [`OutEvent::SendMessage`].
     pub fn add_peer(&mut self, node_id: PublicKey) {
         self.peers.insert(node_id);
     }
+    /// Notifies this node of an incoming event. Make sure to handle all the [`OutEvent`]s produced.
     pub fn handle(&mut self, event: InEvent, _now: Instant) -> impl Iterator<Item = OutEvent> + '_ {
         match event {
             InEvent::RecvMessage(peer_id, msg) => 'handling: {
@@ -491,6 +508,7 @@ impl State {
             .retain(|_, t| !matches!(t, TxState::Finished { .. }));
         self.outbox.drain(..)
     }
+    /// Maximum size of messages this node will send or accept.
     pub fn max_message_size(&self) -> usize {
         self.config.max_message_size
     }
@@ -820,34 +838,78 @@ fn distance(a: PublicKey, b: Hash) -> (u128, u128) {
     (d1, d2)
 }
 
+/// Node configuration
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
+    /// Maximum amount of memory or storage space, in bytes, that this node will allow its blob
+    /// store to use before deleting unused data.
     pub max_storage_use: u64,
+    /// Maximum size of messages this node will accept or send.
     pub max_message_size: usize,
 }
 
+/// Event sent to this node's state machine.
+///
+/// This event should be produced by some networking code and sent to the [`State::handle`] function.
 #[derive(Debug, Clone)]
 pub enum InEvent {
+    /// We've received a [`Message`] from another peer with this [`PublicKey`].
     RecvMessage(PublicKey, Message),
+    /// We've checked the local status of some data in our [`Blobs`](iroh_blobs::net_protocol::Blobs) instance,
+    /// and received this [`BlobStatus`].
     CheckedBlob(Uuid, BlobStatus),
+    /// We've successfully downloaded a blob as part of the transaction identified by this [`Uuid`].
+    /// This also specifies the size of this blob.
     DownloadedBlob(Uuid, u64),
+    /// The connection to the peer with this [`PublicKey`], for the transaction identified by this [`Uuid`], timed out.
     Timeout(Uuid, PublicKey),
+    /// We want to find the data associated with this [`struct@Hash`].
     Find(Hash),
+    /// We have the blob associated with this [`struct@Hash`] in our [`Blobs`](iroh_blobs::net_protocol::Blobs) instance,
+    /// of this size in bytes, and we want to insert it into the network.
     Insert(Hash, u64),
+    /// The peer with this [`PublicKey`] has disconnected from us.
     PeerDisconnected(PublicKey),
 }
 
+/// Event produced by this node's state machine.
+///
+/// This is produced by the [`Iterator`] returned by [`State::handle`], and provides instructions
+/// or feedback to a networking implementation.
 #[derive(Debug, Clone)]
 pub enum OutEvent {
+    /// You must send this [`Message`] to the peer with this [`PublicKey`]. The peer may reply
+    /// with other [`Message`]s, in which case you must return those to this [`State`] with an
+    /// [`InEvent::RecvMessage`].
+    ///
+    /// This [`PublicKey`] may come from a [`State::add_peer`] call, in which case you should
+    /// have dialing information for this peer, or it may have been automatically discovered
+    /// from a [`Message`] received by this peer, in which case it will be accompanied by an
+    /// [`OutEvent::PeerInfo`] providing this information.
     SendMessage(PublicKey, Message),
+    /// You must check your local [`Blobs`](iroh_blobs::net_protocol::Blobs) store for a blob
+    /// with this [`struct@Hash`] using [`Client::status`](iroh_blobs::rpc::client::blobs::Client::status).
+    /// Return the resulting [`BlobStatus`] to this [`State`] by supplying an
+    /// [`InEvent::CheckedBlob`] to [`State::handle`].
     CheckBlob(Uuid, Hash),
+    /// You must download the data blob with this [`struct@Hash`] from this [`NodeAddr`] using
+    /// [`Client::download`](iroh_blobs::rpc::client::blobs::Client::download). This `u64` is
+    /// the size of the blob as claimed by the peer who provides it.
     DownloadBlob(Uuid, NodeAddr, Hash, u64),
+    /// You must save this [`NodeAddr`] and be ready to use it to make connections to using its [`PublicKey`].
     PeerInfo(NodeAddr),
+    /// We've found data associated with this [`struct@Hash`].
     Found(Hash),
+    /// We've finished downloading the blob with this [`struct@Hash`]. You may now retrieve it
+    /// from the [`Blobs`](iroh_blobs::net_protocol::Blobs) instance.
     Downloaded(Hash),
+    /// We checked enough peers and didn't find the data with this [`struct@Hash`].
     NotFound(Hash),
+    /// We successfully inserted data with this [`struct@Hash`] into the network.
     Inserted(Hash),
+    /// We couldn't send the data with this [`struct@Hash`] to enough peers to insert it.
     NotInserted(Hash),
+    /// You must disconnect from the peer with this [`PublicKey`].
     DisconnectPeer(PublicKey),
 }
 

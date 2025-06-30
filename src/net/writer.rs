@@ -4,6 +4,7 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::proto::Message;
 
+/// Write a [`Message`] of at most `max_message_size` bytes into `writer`.
 pub async fn write_message(
     writer: &mut (impl AsyncWrite + Unpin),
     buffer: &mut BytesMut,
