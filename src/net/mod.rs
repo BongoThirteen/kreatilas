@@ -2,7 +2,6 @@ use std::{
     collections::{BTreeMap, HashMap, hash_map::Entry},
     future::pending,
     mem,
-    pin::Pin,
     sync::Arc,
     time::Duration,
 };
@@ -13,25 +12,24 @@ use bytes::BytesMut;
 use chrono::DateTime;
 use futures::StreamExt;
 use iroh::{
-    Endpoint, NodeAddr, NodeId, PublicKey, endpoint::Connection, protocol::ProtocolHandler,
+    Endpoint, NodeAddr, NodeId, PublicKey, Watcher,
+    endpoint::Connection,
+    protocol::{AcceptError, ProtocolHandler},
 };
-use iroh_blobs::{
-    net_protocol::Blobs,
-    rpc::client::blobs::{BlobStatus, DownloadOutcome, MemClient},
-    store::Store,
-};
-use iroh_gossip::net::util::Timers;
+use iroh_blobs::api::{Store, blobs::BlobStatus, downloader::Downloader};
+use iroh_gossip::proto::util::TimerMap;
 use n0_future::{
     task::{AbortOnDropHandle, JoinSet},
     time::Instant,
 };
 use reader::read_message;
 use tokio::{
-    join, select, spawn,
+    select, spawn,
     sync::{
         mpsc::{Receiver, Sender, channel},
         oneshot,
     },
+    time::sleep_until,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
@@ -102,16 +100,11 @@ impl Builder {
         self
     }
     /// Spawn an actor and get a handle to it.
-    pub async fn spawn<S: Store>(
-        self,
-        endpoint: Endpoint,
-        blobs: &Blobs<S>,
-    ) -> anyhow::Result<Kreatilas> {
-        let node_addr = endpoint.node_addr().await?;
-        let blobs_client = blobs.client().clone();
+    pub async fn spawn(self, endpoint: Endpoint, blobs: &Store) -> anyhow::Result<Kreatilas> {
+        let node_addr = endpoint.node_addr().initialized().await?;
         let config = self.config;
 
-        let (actor, to_actor_tx) = Actor::new(endpoint, node_addr, blobs_client, config).await;
+        let (actor, to_actor_tx) = Actor::new(endpoint, node_addr, blobs.clone(), config).await;
         let actor_handle = spawn(async move {
             _ = actor.run().await;
         });
@@ -136,7 +129,7 @@ impl Kreatilas {
     /// Attempts to retrieve a piece of data, identified by its [BLAKE3](https://github.com/BLAKE3-team/BLAKE3) hash, from this peer's
     /// network. Returns `Ok(Some(download_outcome))` if the data was retrieved and stored in
     /// the blobs instance supplied to [`Builder::spawn`], or `Ok(None)` otherwise.
-    pub async fn get(&self, key: Hash) -> anyhow::Result<Option<DownloadOutcome>> {
+    pub async fn get(&self, key: Hash) -> anyhow::Result<Option<u64>> {
         let (send, recv) = oneshot::channel();
         self.inner
             .to_actor_tx
@@ -205,7 +198,7 @@ enum ToActor {
     Get {
         key: Hash,
         #[debug("Sender")]
-        result: oneshot::Sender<Option<DownloadOutcome>>,
+        result: oneshot::Sender<Option<u64>>,
     },
     AddPeer {
         node_addr: NodeAddr,
@@ -221,14 +214,15 @@ enum ToActor {
 struct Actor {
     state: State,
     dialer: Dialer,
-    blobs_client: MemClient,
+    downloader: Downloader,
+    store: Store,
     to_actor_rx: Receiver<ToActor>,
     in_event_tx: Sender<InEvent>,
     in_event_rx: Receiver<InEvent>,
-    get_results: HashMap<Hash, oneshot::Sender<Option<DownloadOutcome>>>,
+    get_results: HashMap<Hash, oneshot::Sender<Option<u64>>>,
     put_results: HashMap<Hash, oneshot::Sender<bool>>,
     peers: HashMap<NodeId, PeerState>,
-    timers: Timers<(Uuid, PublicKey)>,
+    timers: TimerMap<(Uuid, PublicKey)>,
     connection_tasks: JoinSet<(NodeId, Connection, anyhow::Result<()>)>,
 }
 
@@ -236,7 +230,7 @@ impl Actor {
     async fn new(
         endpoint: Endpoint,
         node_addr: NodeAddr,
-        blobs_client: MemClient,
+        store: Store,
         config: Config,
     ) -> (Self, Sender<ToActor>) {
         let (to_actor_tx, to_actor_rx) = channel(16);
@@ -246,15 +240,16 @@ impl Actor {
 
         let actor = Actor {
             state,
+            downloader: store.downloader(&endpoint),
             dialer: Dialer::new(endpoint),
-            blobs_client,
+            store,
             to_actor_rx,
             in_event_tx,
             in_event_rx,
             get_results: HashMap::new(),
             put_results: HashMap::new(),
             peers: HashMap::new(),
-            timers: Timers::default(),
+            timers: TimerMap::default(),
             connection_tasks: JoinSet::default(),
         };
 
@@ -277,7 +272,7 @@ impl Actor {
                         self.handle_connection(node_id, conn, origin).await;
                     }
                     Some(ToActor::Put { key, result }) => {
-                        if let BlobStatus::Complete { size } = self.blobs_client.status(key.into()).await? {
+                        if let BlobStatus::Complete { size } = self.store.status(key).await? {
                             self.put_results.insert(key, result);
                             self.handle_in_event(InEvent::Insert(key, size), Instant::now()).await?;
                         } else {
@@ -332,7 +327,7 @@ impl Actor {
                 let in_event = in_event.expect("in_event_tx is never dropped before receiver");
                 self.handle_in_event(in_event, Instant::now()).await?;
             }
-            timers = self.timers.wait_and_drain() => {
+            timers = wait_and_drain(&mut self.timers) => {
                 let now = Instant::now();
                 for (_instant, (tx_id, peer_id)) in timers {
                     self.handle_in_event(InEvent::Timeout(tx_id, peer_id), now).await?;
@@ -438,18 +433,19 @@ impl Actor {
                 }
                 OutEvent::CheckBlob(tx_id, key) => {
                     let in_event_tx = self.in_event_tx.clone();
-                    let client = self.blobs_client.clone();
+                    let client = self.store.clone();
                     spawn(async move {
-                        if let Ok(status) = client.status(key.into()).await {
+                        if let Ok(status) = client.status(key).await {
                             _ = in_event_tx.send(InEvent::CheckedBlob(tx_id, status)).await;
                         }
                     });
                 }
                 OutEvent::DownloadBlob(tx_id, from, key, size) => {
-                    let client = self.blobs_client.clone();
+                    let downloader = self.downloader.clone();
+                    let store = self.store.clone();
                     let in_event_tx = self.in_event_tx.clone();
                     spawn(async move {
-                        let mut listing = match client.list().await {
+                        let mut listing = match store.list().stream().await {
                             Ok(listing) => listing,
                             Err(err) => {
                                 warn!(%err, "failed to list blobs");
@@ -459,10 +455,13 @@ impl Actor {
                         let mut storage_use = 0;
                         let mut sizes = HashMap::new();
 
-                        while let Some(info) = listing.next().await {
-                            if let Ok(info) = info {
-                                storage_use += info.size;
-                                sizes.insert(info.hash, info.size);
+                        while let Some(Ok(hash)) = listing.next().await {
+                            if let Ok(BlobStatus::Complete { size })
+                            | Ok(BlobStatus::Partial { size: Some(size) }) =
+                                store.status(hash).await
+                            {
+                                storage_use += size;
+                                sizes.insert(hash, size);
                             }
                         }
 
@@ -470,7 +469,7 @@ impl Actor {
                             let to_reclaim = storage_use + size - max_storage_use;
                             let mut reclaimed = 0;
 
-                            let mut listing = match client.tags().list().await {
+                            let mut listing = match store.tags().list().await {
                                 Ok(listing) => listing,
                                 Err(err) => {
                                     warn!(%err, "failed to list tags");
@@ -500,39 +499,36 @@ impl Actor {
                                 }
                             }
 
+                            let mut to_delete = Vec::new();
                             while reclaimed < to_reclaim {
                                 let Some((_time, (hash, size))) = tags.pop_first() else {
                                     warn!("not enough storage");
                                     return;
                                 };
 
-                                if let Err(err) = client.delete_blob(hash).await {
-                                    warn!(%err, "failed to delete blob");
-                                    return;
-                                }
-
+                                to_delete.push(hash);
                                 reclaimed += size;
+                            }
+                            if let Err(err) = store.delete(to_delete).await {
+                                warn!(%err, "failed to delete blob");
+                                return;
                             }
                         }
 
-                        let progress = match client.download(key.into(), from).await {
-                            Ok(progress) => progress,
-                            Err(err) => {
-                                warn!(%err, "failed to download blob");
-                                return;
-                            }
-                        };
-                        let outcome = match progress.await {
-                            Ok(outcome) => outcome,
-                            Err(err) => {
-                                warn!(%err, "failed to download blob");
-                                return;
-                            }
-                        };
-                        debug!(?outcome, "download concluded");
-                        if let Err(err) = in_event_tx
-                            .send(InEvent::DownloadedBlob(tx_id, outcome))
+                        if let Err(err) = downloader
+                            .download(iroh_blobs::Hash::from(key), [from.node_id])
                             .await
+                        {
+                            warn!(%err, "failed to download blob");
+                            return;
+                        }
+                        let Ok(BlobStatus::Complete { size }) = store.status(key).await else {
+                            warn!("blob not found in local storage");
+                            return;
+                        };
+                        debug!("download concluded");
+                        if let Err(err) =
+                            in_event_tx.send(InEvent::DownloadedBlob(tx_id, size)).await
                         {
                             warn!(%err, "failed to send download notification");
                         }
@@ -570,6 +566,18 @@ impl Actor {
             }
         }
         Ok(())
+    }
+}
+
+async fn wait_and_drain(
+    map: &mut TimerMap<(Uuid, PublicKey)>,
+) -> Vec<(Instant, (Uuid, PublicKey))> {
+    match map.first().copied() {
+        Some(instant) => {
+            sleep_until(instant).await;
+            map.drain_until(&instant).collect()
+        }
+        None => std::future::pending().await,
     }
 }
 
@@ -740,38 +748,39 @@ async fn connection_loop(
         anyhow::Ok(())
     };
 
-    let res = join!(send_loop, recv_loop);
-    res.0.context("send_loop").and(res.1.context("recv_loop"))
+    select! {
+        res = send_loop => {
+            res.context("send_loop")
+        }
+        res = recv_loop => {
+            res.context("recv_loop")
+        }
+    }
 }
 
 impl Inner {
-    async fn handle_connection(&self, conn: Connection) -> anyhow::Result<()> {
+    async fn handle_connection(&self, conn: Connection) -> Result<(), AcceptError> {
         let node_id = conn.remote_node_id()?;
         self.to_actor_tx
             .send(ToActor::HandleConnection(node_id, conn, ConnOrigin::Accept))
-            .await?;
-        Ok(())
+            .await
+            .map_err(|_| AcceptError::User {
+                source: "failed to send data to channel".into(),
+            })
     }
 }
 
 impl ProtocolHandler for Kreatilas {
-    fn accept(
-        &self,
-        conn: Connection,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'static>> {
-        let inner = self.inner.clone();
-        Box::pin(async move {
-            inner.handle_connection(conn).await?;
-            Ok(())
-        })
+    fn accept(&self, conn: Connection) -> impl Future<Output = Result<(), AcceptError>> + Send {
+        self.inner.handle_connection(conn)
     }
-    fn shutdown(&self) -> n0_future::future::Boxed<()> {
+    fn shutdown(&self) -> impl Future<Output = ()> + Send {
         let to_actor_tx = self.inner.to_actor_tx.clone();
-        Box::pin(async move {
+        async move {
             let (result, recv) = oneshot::channel();
             if to_actor_tx.send(ToActor::Shutdown { result }).await.is_ok() {
                 _ = recv.await;
             }
-        })
+        }
     }
 }

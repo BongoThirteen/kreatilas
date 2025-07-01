@@ -12,16 +12,9 @@ use ed25519_dalek::{
 };
 use futures::StreamExt;
 use gumdrop::Options;
-use iroh::{Endpoint, NodeAddr, SecretKey, protocol::Router};
+use iroh::{Endpoint, NodeAddr, SecretKey, Watcher, protocol::Router};
 use iroh_base::ticket::NodeTicket;
-use iroh_blobs::{
-    export::ExportProgress,
-    net_protocol::Blobs,
-    provider::AddProgress,
-    rpc::client::blobs::WrapOption,
-    store::{ExportFormat, ExportMode},
-    util::SetTagOption,
-};
+use iroh_blobs::{api::blobs::BlobStatus, net_protocol::Blobs, store::mem::MemStore};
 use kreatilas::net::Kreatilas;
 use nu_ansi_term::{Color, Style};
 use rand_core::OsRng;
@@ -79,15 +72,15 @@ async fn main() -> anyhow::Result<()> {
         .bind()
         .await
         .context("failed to bind endpoint")?;
-    let blobs = Blobs::memory().build(&endpoint);
+    let store = MemStore::new();
+    let blobs = Blobs::new(&store, endpoint.clone(), None);
     let handler = Kreatilas::builder()
-        .spawn(endpoint.clone(), &blobs)
+        .spawn(endpoint.clone(), &store)
         .await
         .context("failed to spawn handler")?;
 
-    let blobs_client = blobs.client();
-
-    let node_addr = endpoint.node_addr().await?;
+    let blobs_client = store.blobs();
+    let node_addr = endpoint.node_addr().initialized().await?;
     let node_id = node_addr.node_id;
     let node_ticket = NodeTicket::new(iroh_base::NodeAddr {
         node_id: iroh_base::PublicKey::try_from(node_id.as_bytes())
@@ -145,11 +138,8 @@ async fn main() -> anyhow::Result<()> {
                         };
 
                         match handler.get(key).await {
-                            Ok(Some(outcome)) => {
-                                println!(
-                                    "Where should this {}-byte file go?",
-                                    outcome.local_size + outcome.downloaded_size
-                                );
+                            Ok(Some(local_size)) => {
+                                println!("Where should this {}-byte file go?", local_size);
                                 let file_path = match file_editor.read_line(&file_prompt) {
                                     Ok(Signal::Success(buffer)) => PathBuf::from(buffer),
                                     Ok(Signal::CtrlC) => {
@@ -177,50 +167,13 @@ async fn main() -> anyhow::Result<()> {
                                     }
                                 };
 
-                                let mut progress = match blobs_client
-                                    .export(
-                                        key.into(),
-                                        file_path,
-                                        ExportFormat::Blob,
-                                        ExportMode::Copy,
-                                    )
-                                    .await
-                                {
-                                    Ok(progress) => progress,
+                                match blobs_client.export(key, file_path).await {
+                                    Ok(size) => {
+                                        println!("Wrote {size} bytes");
+                                    }
                                     Err(err) => {
                                         error(&err.to_string());
                                         continue;
-                                    }
-                                };
-
-                                while let Some(prog) = progress.next().await {
-                                    let prog = match prog {
-                                        Ok(prog) => prog,
-                                        Err(err) => {
-                                            error(&err.to_string());
-                                            continue;
-                                        }
-                                    };
-
-                                    match prog {
-                                        ExportProgress::Found { size, .. } => {
-                                            println!(
-                                                "Found file {}",
-                                                format!("({} bytes)", size.value()).white()
-                                            );
-                                        }
-                                        ExportProgress::Progress { offset, .. } => {
-                                            println!("Exported {} bytes", offset);
-                                        }
-                                        ExportProgress::Done { .. } => {
-                                            println!("Done");
-                                        }
-                                        ExportProgress::AllDone => {
-                                            println!("All done");
-                                        }
-                                        ExportProgress::Abort(err) => {
-                                            error(&err.to_string());
-                                        }
                                     }
                                 }
                             }
@@ -250,51 +203,15 @@ async fn main() -> anyhow::Result<()> {
                             }
                         };
 
-                        let mut progress = match blobs_client
-                            .add_from_path(file_path, false, SetTagOption::Auto, WrapOption::NoWrap)
-                            .await
-                        {
-                            Ok(progress) => progress,
+                        let file_hash = match blobs_client.add_path(file_path).await {
+                            Ok(info) => {
+                                println!("Added file to local store");
+                                info.hash
+                            }
                             Err(err) => {
                                 error(&err.to_string());
                                 continue;
                             }
-                        };
-
-                        let mut file_hash = None;
-
-                        while let Some(prog) = progress.next().await {
-                            let prog = match prog {
-                                Ok(prog) => prog,
-                                Err(err) => {
-                                    error(&err.to_string());
-                                    continue;
-                                }
-                            };
-
-                            match prog {
-                                AddProgress::Found { size, .. } => {
-                                    println!("Found file ({} bytes)", size);
-                                }
-                                AddProgress::Progress { offset, .. } => {
-                                    println!("Added {} bytes", offset);
-                                }
-                                AddProgress::Done { .. } => {
-                                    println!("Done");
-                                }
-                                AddProgress::AllDone { hash, .. } => {
-                                    println!("All done");
-                                    file_hash = Some(hash);
-                                    break;
-                                }
-                                AddProgress::Abort(err) => {
-                                    error(&err.to_string());
-                                }
-                            }
-                        }
-
-                        let Some(file_hash) = file_hash else {
-                            continue;
                         };
 
                         if let Some("local") = words.next().as_deref() {
@@ -360,7 +277,7 @@ async fn main() -> anyhow::Result<()> {
                         );
                     }
                     "list" => {
-                        let mut listing = match blobs_client.list().await {
+                        let mut listing = match blobs_client.list().stream().await {
                             Ok(listing) => listing,
                             Err(err) => {
                                 error(&err.to_string());
@@ -379,13 +296,20 @@ async fn main() -> anyhow::Result<()> {
 
                             println!(
                                 "Blob {} {}",
-                                entry.hash.to_string().green(),
-                                format!("({} bytes)", entry.size).white(),
+                                entry.to_string().green(),
+                                if let Ok(BlobStatus::Complete { size })
+                                | Ok(BlobStatus::Partial { size: Some(size) }) =
+                                    blobs_client.status(entry).await
+                                {
+                                    format!("({} bytes)", size).white()
+                                } else {
+                                    format!("(unknown size)").white()
+                                },
                             );
                         }
                     }
                     "tags" => {
-                        let mut listing = match blobs_client.tags().list().await {
+                        let mut listing = match store.tags().list().await {
                             Ok(listing) => listing,
                             Err(err) => {
                                 error(&err.to_string());

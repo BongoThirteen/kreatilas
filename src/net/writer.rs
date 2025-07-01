@@ -1,5 +1,5 @@
+use anyhow::bail;
 use bytes::BytesMut;
-use iroh_gossip::net::util::WriteError;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::proto::Message;
@@ -10,10 +10,10 @@ pub async fn write_message(
     buffer: &mut BytesMut,
     frame: &Message,
     max_message_size: usize,
-) -> Result<(), WriteError> {
+) -> anyhow::Result<()> {
     let len = postcard::experimental::serialized_size(frame)?;
     if len >= max_message_size {
-        return Err(WriteError::TooLarge);
+        bail!("message would be {len}B (larger than {max_message_size}B)");
     }
 
     buffer.clear();

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use blake3::Hash;
 use iroh::{NodeAddr, PublicKey};
-use iroh_blobs::rpc::client::blobs::{BlobStatus, DownloadOutcome};
+use iroh_blobs::api::blobs::BlobStatus;
 use n0_future::time::Instant;
 use rand::{Rng, rng};
 use serde::{Deserialize, Serialize};
@@ -66,8 +66,6 @@ enum MessageData {
     },
     /// This connection is active.
     Pulse,
-    /// You sent an incorrect message.
-    Error,
 }
 
 /// Node state
@@ -141,7 +139,6 @@ impl State {
                     match self.transactions.get_mut(&msg.tx_id) {
                         Some(tx) => tx,
                         None => {
-                            send_error(peer_id, &msg, &mut self.outbox);
                             break 'handling;
                         }
                     }
@@ -193,6 +190,7 @@ impl State {
                                         },
                                     },
                                 ));
+                                *tx = TxState::Finished { from: *from };
                             } else {
                                 if let Some(send_to) = self
                                     .peers
@@ -220,6 +218,7 @@ impl State {
                                             },
                                         },
                                     ));
+                                    *tx = TxState::Finished { from: *from };
                                 }
                             }
                         }
@@ -282,7 +281,7 @@ impl State {
                                 }
                             }
                         }
-                        TxState::Errored { .. } | TxState::Finished { .. } => {}
+                        TxState::Finished { .. } => {}
                     }
                 }
             }
@@ -305,7 +304,7 @@ impl State {
                                         data: MessageData::Ready {
                                             addr: self.node_addr.clone(),
                                             data: *key,
-                                            size: outcome.local_size,
+                                            size: outcome,
                                         },
                                     },
                                 ));
@@ -331,7 +330,7 @@ impl State {
                                         data: MessageData::Ready {
                                             addr: self.node_addr.clone(),
                                             data: *key,
-                                            size: outcome.local_size,
+                                            size: outcome,
                                         },
                                     },
                                 ));
@@ -346,6 +345,7 @@ impl State {
                                         data: MessageData::Inserted,
                                     },
                                 ));
+                                *tx = TxState::Finished { from: *from };
                             }
                         }
                         _ => {}
@@ -377,8 +377,10 @@ impl State {
                                         data: MessageData::Find { key: *key },
                                     },
                                 ));
+                                tried.insert(timeout_peer);
                             } else if *from == self.node_addr.node_id {
                                 self.outbox.push(OutEvent::NotFound(*key));
+                                *tx = TxState::Finished { from: *from };
                             } else {
                                 self.outbox.push(OutEvent::SendMessage(
                                     *from,
@@ -391,6 +393,7 @@ impl State {
                                         },
                                     },
                                 ));
+                                *tx = TxState::Finished { from: *from };
                             }
                         }
                         TxState::Inserting {
@@ -400,6 +403,7 @@ impl State {
                             key,
                             size,
                             tried,
+                            from,
                             ..
                         } if !tried.contains(&timeout_peer) => {
                             if let Some(send_to) = self
@@ -423,6 +427,7 @@ impl State {
                                 ));
                             } else if origin.node_id == self.node_addr.node_id {
                                 self.outbox.push(OutEvent::NotInserted(*key));
+                                *tx = TxState::Finished { from: *from };
                             } else {
                                 self.outbox.push(OutEvent::SendMessage(
                                     origin.node_id,
@@ -435,6 +440,7 @@ impl State {
                                         },
                                     },
                                 ));
+                                *tx = TxState::Finished { from: *from };
                             }
                         }
                         _ => {}
@@ -442,6 +448,10 @@ impl State {
                 }
             }
             InEvent::Find(key) => 'finding: {
+                let Some(send_to) = self.peers.iter().next() else {
+                    self.outbox.push(OutEvent::NotFound(key));
+                    break 'finding;
+                };
                 let tx_id = Uuid::new_v4();
                 self.transactions.insert(
                     tx_id,
@@ -453,10 +463,6 @@ impl State {
                         tried: HashSet::new(),
                     },
                 );
-                let Some(send_to) = self.peers.iter().next() else {
-                    self.outbox.push(OutEvent::NotFound(key));
-                    break 'finding;
-                };
                 self.outbox.push(OutEvent::SendMessage(
                     *send_to,
                     Message {
@@ -515,18 +521,6 @@ impl State {
     }
 }
 
-fn send_error(peer_id: PublicKey, msg: &Message, outbox: &mut Vec<OutEvent>) {
-    outbox.push(OutEvent::SendMessage(
-        peer_id,
-        Message {
-            tx_id: msg.tx_id,
-            hops_to_live: msg.depth,
-            depth: 0,
-            data: MessageData::Error,
-        },
-    ));
-}
-
 fn handle_message(
     node_addr: NodeAddr,
     peer_id: PublicKey,
@@ -538,8 +532,7 @@ fn handle_message(
     match msg.data {
         MessageData::Find { key } => {
             if !matches!(tx, TxState::Starting { .. }) {
-                *tx = TxState::Errored { from: peer_id };
-                send_error(peer_id, &msg, outbox);
+                *tx = TxState::Finished { from: peer_id };
                 return;
             }
 
@@ -559,8 +552,7 @@ fn handle_message(
             size,
         } => {
             if !matches!(tx, TxState::Starting { .. }) {
-                *tx = TxState::Errored { from: peer_id };
-                send_error(peer_id, &msg, outbox);
+                *tx = TxState::Finished { from: peer_id };
                 return;
             }
 
@@ -600,7 +592,9 @@ fn handle_message(
                     ));
                 }
             }
-            TxState::Inserting { origin, key, .. } if origin.node_id != peer_id => {
+            TxState::Inserting {
+                origin, key, from, ..
+            } if origin.node_id != peer_id => {
                 peers.insert(download_from.node_id);
                 outbox.push(OutEvent::DownloadBlob(
                     msg.tx_id,
@@ -610,6 +604,7 @@ fn handle_message(
                 ));
                 if origin.node_id == node_addr.node_id {
                     outbox.push(OutEvent::NotInserted(*key));
+                    *tx = TxState::Finished { from: *from };
                 } else {
                     outbox.push(OutEvent::SendMessage(
                         origin.node_id,
@@ -625,9 +620,7 @@ fn handle_message(
                     ));
                 }
             }
-            _ => {
-                send_error(peer_id, &msg, outbox);
-            }
+            _ => {}
         },
         MessageData::NotFound => match tx {
             TxState::Finding { from, key, .. } if *from != peer_id => {
@@ -684,9 +677,7 @@ fn handle_message(
                     ));
                 }
             }
-            _ => {
-                send_error(peer_id, &msg, outbox);
-            }
+            _ => {}
         },
         MessageData::Continue { hops_remaining } => match tx {
             TxState::Finding {
@@ -713,6 +704,7 @@ fn handle_message(
                     ));
                 } else if *from == node_addr.node_id {
                     outbox.push(OutEvent::NotFound(*key));
+                    *tx = TxState::Finished { from: *from };
                 } else {
                     outbox.push(OutEvent::SendMessage(
                         *from,
@@ -725,6 +717,7 @@ fn handle_message(
                             },
                         },
                     ));
+                    *tx = TxState::Finished { from: *from };
                 }
             }
             TxState::Inserting {
@@ -733,6 +726,7 @@ fn handle_message(
                 key,
                 size,
                 tried,
+                from,
                 ..
             } if origin.node_id != peer_id => {
                 tried.insert(peer_id);
@@ -756,6 +750,7 @@ fn handle_message(
                     ));
                 } else if origin.node_id == node_addr.node_id {
                     outbox.push(OutEvent::NotInserted(*key));
+                    *tx = TxState::Finished { from: *from };
                 } else {
                     outbox.push(OutEvent::SendMessage(
                         origin.node_id,
@@ -766,16 +761,18 @@ fn handle_message(
                             data: MessageData::Continue { hops_remaining },
                         },
                     ));
+                    *tx = TxState::Finished { from: *from };
                 }
             }
-            _ => {
-                send_error(peer_id, &msg, outbox);
-            }
+            _ => {}
         },
         MessageData::Inserted => match tx {
-            TxState::Inserting { origin, key, .. } if origin.node_id != peer_id => {
+            TxState::Inserting {
+                origin, key, from, ..
+            } if origin.node_id != peer_id => {
                 if origin.node_id == node_addr.node_id {
                     outbox.push(OutEvent::Inserted(*key));
+                    *tx = TxState::Finished { from: *from };
                 } else {
                     outbox.push(OutEvent::SendMessage(
                         origin.node_id,
@@ -788,9 +785,7 @@ fn handle_message(
                     ));
                 }
             }
-            _ => {
-                send_error(peer_id, &msg, outbox);
-            }
+            _ => {}
         },
         MessageData::Ready {
             ref addr,
@@ -810,15 +805,9 @@ fn handle_message(
                 peers.insert(addr.node_id);
                 outbox.push(OutEvent::DownloadBlob(msg.tx_id, addr.clone(), data, size));
             }
-            _ => {
-                send_error(peer_id, &msg, outbox);
-            }
+            _ => {}
         },
         MessageData::Pulse => {}
-        MessageData::Error => {
-            let &from = tx.from();
-            *tx = TxState::Errored { from };
-        }
     }
 }
 
@@ -861,7 +850,7 @@ pub enum InEvent {
     CheckedBlob(Uuid, BlobStatus),
     /// We've successfully downloaded a blob as part of the transaction identified by this [`Uuid`].
     /// This also specifies the size of this blob.
-    DownloadedBlob(Uuid, DownloadOutcome),
+    DownloadedBlob(Uuid, u64),
     /// The connection to the peer with this [`PublicKey`], for the transaction identified by this [`Uuid`], timed out.
     Timeout(Uuid, PublicKey),
     /// We want to find the data associated with this [`struct@Hash`].
@@ -903,7 +892,7 @@ pub enum OutEvent {
     Found(Hash),
     /// We've finished downloading the blob with this [`struct@Hash`]. You may now retrieve it
     /// from the [`Blobs`](iroh_blobs::net_protocol::Blobs) instance.
-    Downloaded(Hash, DownloadOutcome),
+    Downloaded(Hash, u64),
     /// We checked enough peers and didn't find the data with this [`struct@Hash`].
     NotFound(Hash),
     /// We successfully inserted data with this [`struct@Hash`] into the network.
@@ -935,9 +924,6 @@ enum TxState {
         size: u64,
         tried: HashSet<PublicKey>,
     },
-    Errored {
-        from: PublicKey,
-    },
     Finished {
         from: PublicKey,
     },
@@ -949,7 +935,6 @@ impl TxState {
             TxState::Starting { from } => from,
             TxState::Finding { from, .. } => from,
             TxState::Inserting { origin, .. } => &origin.node_id,
-            TxState::Errored { from } => from,
             TxState::Finished { from } => from,
         }
     }
