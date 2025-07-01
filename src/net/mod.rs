@@ -17,7 +17,7 @@ use iroh::{
 };
 use iroh_blobs::{
     net_protocol::Blobs,
-    rpc::client::blobs::{BlobStatus, MemClient},
+    rpc::client::blobs::{BlobStatus, DownloadOutcome, MemClient},
     store::Store,
 };
 use iroh_gossip::net::util::Timers;
@@ -133,22 +133,22 @@ impl Kreatilas {
     pub fn builder() -> Builder {
         Builder::default()
     }
-    /// Attempts to retrieve a piece of data, identified by its BLAKE3 hash, from this peer's
-    /// network. Returns `Ok(true)` if the data was retrieved and stored in the blobs instance
-    /// supplied to [`Builder::spawn`], or `Ok(false)` otherwise.
-    pub async fn get(&self, key: Hash) -> anyhow::Result<bool> {
+    /// Attempts to retrieve a piece of data, identified by its [BLAKE3](https://github.com/BLAKE3-team/BLAKE3) hash, from this peer's
+    /// network. Returns `Ok(Some(download_outcome))` if the data was retrieved and stored in
+    /// the blobs instance supplied to [`Builder::spawn`], or `Ok(None)` otherwise.
+    pub async fn get(&self, key: Hash) -> anyhow::Result<Option<DownloadOutcome>> {
         let (send, recv) = oneshot::channel();
         self.inner
             .to_actor_tx
             .send(ToActor::Get { key, result: send })
             .await?;
-        let res = recv.await?;
-        Ok(res)
+        Ok(recv.await?)
     }
 
     /// Attempts to insert a piece of data, stored in this `Kreatilas` instance's associated `Blobs`
-    /// instance and identified by its BLAKE3 hash, into this peer's network. Returns `Ok(true)` if
-    /// the data was inserted into the required number of peers, or `Ok(false)` otherwise.
+    /// instance and identified by its [BLAKE3](https://github.com/BLAKE3-team/BLAKE3) hash, into
+    /// this peer's network. Returns `Ok(true)` if the data was inserted into the required number
+    /// of peers, or `Ok(false)` otherwise.
     pub async fn put(&self, key: Hash) -> anyhow::Result<bool> {
         let (send, recv) = oneshot::channel();
         self.inner
@@ -172,6 +172,20 @@ impl Kreatilas {
         let res = recv.await?;
         Ok(res)
     }
+
+    /// Shutdown this node
+    ///
+    /// Currently this does not end all ongoing transactions gracefully, but your peers
+    /// should handle it.
+    pub async fn shutdown(&self) -> anyhow::Result<()> {
+        let (send, recv) = oneshot::channel();
+        self.inner
+            .to_actor_tx
+            .send(ToActor::Shutdown { result: send })
+            .await?;
+        let res = recv.await?;
+        Ok(res)
+    }
 }
 
 #[derive(Debug)]
@@ -191,11 +205,14 @@ enum ToActor {
     Get {
         key: Hash,
         #[debug("Sender")]
-        result: oneshot::Sender<bool>,
+        result: oneshot::Sender<Option<DownloadOutcome>>,
     },
     AddPeer {
         node_addr: NodeAddr,
         #[debug("Sender")]
+        result: oneshot::Sender<()>,
+    },
+    Shutdown {
         result: oneshot::Sender<()>,
     },
 }
@@ -208,7 +225,8 @@ struct Actor {
     to_actor_rx: Receiver<ToActor>,
     in_event_tx: Sender<InEvent>,
     in_event_rx: Receiver<InEvent>,
-    results: HashMap<Hash, oneshot::Sender<bool>>,
+    get_results: HashMap<Hash, oneshot::Sender<Option<DownloadOutcome>>>,
+    put_results: HashMap<Hash, oneshot::Sender<bool>>,
     peers: HashMap<NodeId, PeerState>,
     timers: Timers<(Uuid, PublicKey)>,
     connection_tasks: JoinSet<(NodeId, Connection, anyhow::Result<()>)>,
@@ -233,7 +251,8 @@ impl Actor {
             to_actor_rx,
             in_event_tx,
             in_event_rx,
-            results: HashMap::new(),
+            get_results: HashMap::new(),
+            put_results: HashMap::new(),
             peers: HashMap::new(),
             timers: Timers::default(),
             connection_tasks: JoinSet::default(),
@@ -259,14 +278,14 @@ impl Actor {
                     }
                     Some(ToActor::Put { key, result }) => {
                         if let BlobStatus::Complete { size } = self.blobs_client.status(key.into()).await? {
-                            self.results.insert(key, result);
+                            self.put_results.insert(key, result);
                             self.handle_in_event(InEvent::Insert(key, size), Instant::now()).await?;
                         } else {
                             _ = result.send(false);
                         }
                     }
                     Some(ToActor::Get { key, result }) => {
-                        self.results.insert(key, result);
+                        self.get_results.insert(key, result);
                         self.handle_in_event(InEvent::Find(key), Instant::now()).await?;
                     }
                     Some(ToActor::AddPeer { node_addr, result }) => {
@@ -286,6 +305,13 @@ impl Actor {
                                 queue.push(Message::pulse());
                             }
                         }
+                    }
+                    Some(ToActor::Shutdown { result }) => {
+                        self.peers.clear();
+                        self.dialer.shutdown().await;
+                        while let Some(_) = self.connection_tasks.join_next().await {}
+                        _ = result.send(());
+                        return Ok(false);
                     }
                     None => return Ok(false),
                 }
@@ -505,7 +531,7 @@ impl Actor {
                         };
                         debug!(?outcome, "download concluded");
                         if let Err(err) = in_event_tx
-                            .send(InEvent::DownloadedBlob(tx_id, outcome.local_size))
+                            .send(InEvent::DownloadedBlob(tx_id, outcome))
                             .await
                         {
                             warn!(%err, "failed to send download notification");
@@ -517,14 +543,24 @@ impl Actor {
                         warn!(%err, "failed to add node address");
                     }
                 }
-                OutEvent::Downloaded(key) | OutEvent::Inserted(key) => {
-                    if let Some(res) = self.results.remove(&key) {
+                OutEvent::Downloaded(key, outcome) => {
+                    if let Some(res) = self.get_results.remove(&key) {
+                        _ = res.send(Some(outcome));
+                    }
+                }
+                OutEvent::Inserted(key) => {
+                    if let Some(res) = self.put_results.remove(&key) {
                         _ = res.send(true);
                     }
                 }
                 OutEvent::Found(_key) => {}
-                OutEvent::NotFound(key) | OutEvent::NotInserted(key) => {
-                    if let Some(res) = self.results.remove(&key) {
+                OutEvent::NotFound(key) => {
+                    if let Some(res) = self.get_results.remove(&key) {
+                        _ = res.send(None);
+                    }
+                }
+                OutEvent::NotInserted(key) => {
+                    if let Some(res) = self.put_results.remove(&key) {
                         _ = res.send(false);
                     }
                 }
@@ -599,6 +635,12 @@ impl Dialer {
             }
             true => pending().await,
         }
+    }
+    async fn shutdown(&mut self) {
+        for (_, cancel) in self.pending_dials.drain() {
+            cancel.cancel();
+        }
+        while let Some(_) = self.pending.join_next().await {}
     }
 }
 
@@ -721,6 +763,15 @@ impl ProtocolHandler for Kreatilas {
         Box::pin(async move {
             inner.handle_connection(conn).await?;
             Ok(())
+        })
+    }
+    fn shutdown(&self) -> n0_future::future::Boxed<()> {
+        let to_actor_tx = self.inner.to_actor_tx.clone();
+        Box::pin(async move {
+            let (result, recv) = oneshot::channel();
+            if to_actor_tx.send(ToActor::Shutdown { result }).await.is_ok() {
+                _ = recv.await;
+            }
         })
     }
 }

@@ -5,13 +5,13 @@ use std::{
 
 use anyhow::Context;
 use blake3::Hash;
-use clap::Parser;
 use colored::Colorize;
 use ed25519_dalek::{
     SigningKey,
     pkcs8::{DecodePrivateKey, EncodePrivateKey, spki::der::pem::LineEnding},
 };
 use futures::StreamExt;
+use gumdrop::Options;
 use iroh::{Endpoint, NodeAddr, SecretKey, protocol::Router};
 use iroh_base::ticket::NodeTicket;
 use iroh_blobs::{
@@ -33,10 +33,9 @@ use tokio::{fs::try_exists, main};
 use tracing_subscriber::{EnvFilter, fmt};
 
 /// Node for a peer-to-peer data distribution network
-#[derive(Debug, Clone, Parser)]
-#[clap(version, author)]
+#[derive(Debug, Clone, Options)]
 struct Cli {
-    #[clap(short, long)]
+    #[options(help = "file to load your node's private key from, or save it to")]
     key_file: Option<PathBuf>,
 }
 
@@ -44,7 +43,7 @@ struct Cli {
 async fn main() -> anyhow::Result<()> {
     fmt().with_env_filter(EnvFilter::from_default_env()).init();
 
-    let args = Cli::parse();
+    let args = Cli::parse_args_default_or_exit();
 
     let mut builder = Endpoint::builder();
 
@@ -104,7 +103,7 @@ async fn main() -> anyhow::Result<()> {
     println!(
         "{}{}\n\nUse `{}` to connect\n",
         "You are node ".white(),
-        node_id.to_string().green(),
+        node_id.fmt_short().green(),
         format!("peer {node_ticket}").green()
     );
 
@@ -137,7 +136,7 @@ async fn main() -> anyhow::Result<()> {
                             continue;
                         };
 
-                        let key: Hash = match key.parse() {
+                        let key: Hash = match key.parse::<iroh_blobs::Hash>().map(Into::into) {
                             Ok(key) => key,
                             Err(err) => {
                                 error(&format!("failed to parse key {}", format!("({err})").red()));
@@ -146,7 +145,11 @@ async fn main() -> anyhow::Result<()> {
                         };
 
                         match handler.get(key).await {
-                            Ok(true) => {
+                            Ok(Some(outcome)) => {
+                                println!(
+                                    "Where should this {}-byte file go?",
+                                    outcome.local_size + outcome.downloaded_size
+                                );
                                 let file_path = match file_editor.read_line(&file_prompt) {
                                     Ok(Signal::Success(buffer)) => PathBuf::from(buffer),
                                     Ok(Signal::CtrlC) => {
@@ -221,7 +224,7 @@ async fn main() -> anyhow::Result<()> {
                                     }
                                 }
                             }
-                            Ok(false) => {
+                            Ok(None) => {
                                 println!("Entry not found {}", ":(".cyan());
                             }
                             Err(err) => {
@@ -231,7 +234,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                     "put" => {
                         let Some(file_path) = words.next() else {
-                            error("please specify a key to retrieve");
+                            error("please specify a file to insert");
                             continue;
                         };
 
@@ -295,13 +298,17 @@ async fn main() -> anyhow::Result<()> {
                         };
 
                         if let Some("local") = words.next().as_deref() {
-                            println!("\n{}{}", "Put key ".white(), file_hash.to_hex().green());
+                            println!("\n{}{}", "Put key ".white(), file_hash.to_string().green());
                             continue;
                         }
 
                         match handler.put(file_hash.into()).await {
                             Ok(true) => {
-                                println!("\n{}{}", "Put key ".white(), file_hash.to_hex().green());
+                                println!(
+                                    "\n{}{}",
+                                    "Put key ".white(),
+                                    file_hash.to_string().green()
+                                );
                             }
                             Ok(false) => {
                                 println!("Not enough peers {}", ":(".cyan());
@@ -372,7 +379,7 @@ async fn main() -> anyhow::Result<()> {
 
                             println!(
                                 "Blob {} {}",
-                                entry.hash.to_hex().green(),
+                                entry.hash.to_string().green(),
                                 format!("({} bytes)", entry.size).white(),
                             );
                         }
@@ -471,7 +478,7 @@ impl Highlighter for NodeHighlighter {
                     return text;
                 };
 
-                let Ok(_key) = key.trim().parse::<Hash>() else {
+                let Ok(_key) = key.trim().parse::<iroh_blobs::Hash>() else {
                     text.push((Style::new().fg(Color::Red), key.to_string()));
                     for word in words {
                         text.push((Style::new().fg(Color::Red), word.to_string()));

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use blake3::Hash;
 use iroh::{NodeAddr, PublicKey};
-use iroh_blobs::rpc::client::blobs::BlobStatus;
+use iroh_blobs::rpc::client::blobs::{BlobStatus, DownloadOutcome};
 use n0_future::time::Instant;
 use rand::{Rng, rng};
 use serde::{Deserialize, Serialize};
@@ -286,14 +286,15 @@ impl State {
                     }
                 }
             }
-            InEvent::DownloadedBlob(tx_id, size) => {
+            InEvent::DownloadedBlob(tx_id, outcome) => {
                 if let Some(tx) = self.transactions.get_mut(&tx_id) {
                     match tx {
                         TxState::Finding {
                             from, depth, key, ..
                         } => {
                             if *from == self.node_addr.node_id {
-                                self.outbox.push(OutEvent::Downloaded(*key));
+                                self.outbox
+                                    .push(OutEvent::Downloaded(*key, outcome.clone()));
                             } else {
                                 self.outbox.push(OutEvent::SendMessage(
                                     *from,
@@ -304,7 +305,7 @@ impl State {
                                         data: MessageData::Ready {
                                             addr: self.node_addr.clone(),
                                             data: *key,
-                                            size,
+                                            size: outcome.local_size,
                                         },
                                     },
                                 ));
@@ -330,7 +331,7 @@ impl State {
                                         data: MessageData::Ready {
                                             addr: self.node_addr.clone(),
                                             data: *key,
-                                            size,
+                                            size: outcome.local_size,
                                         },
                                     },
                                 ));
@@ -860,7 +861,7 @@ pub enum InEvent {
     CheckedBlob(Uuid, BlobStatus),
     /// We've successfully downloaded a blob as part of the transaction identified by this [`Uuid`].
     /// This also specifies the size of this blob.
-    DownloadedBlob(Uuid, u64),
+    DownloadedBlob(Uuid, DownloadOutcome),
     /// The connection to the peer with this [`PublicKey`], for the transaction identified by this [`Uuid`], timed out.
     Timeout(Uuid, PublicKey),
     /// We want to find the data associated with this [`struct@Hash`].
@@ -902,7 +903,7 @@ pub enum OutEvent {
     Found(Hash),
     /// We've finished downloading the blob with this [`struct@Hash`]. You may now retrieve it
     /// from the [`Blobs`](iroh_blobs::net_protocol::Blobs) instance.
-    Downloaded(Hash),
+    Downloaded(Hash, DownloadOutcome),
     /// We checked enough peers and didn't find the data with this [`struct@Hash`].
     NotFound(Hash),
     /// We successfully inserted data with this [`struct@Hash`] into the network.
