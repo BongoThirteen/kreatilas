@@ -28,7 +28,8 @@ Don't use it to leak classified documents.
 - [x] Inserting and retrieving files
 - [x] BLAKE3 verified streaming of file data
 - [x] Deniability of both insertion and retrieval
+- [x] Management of local data
+- [x] Automated peer discovery
 - [ ] File encryption at rest
-- [ ] Management of local data
-- [ ] Node discovery options other than [number0](n0.computer)'s servers
-- [ ] Automated peer discovery
+- [ ] Direct streaming of data
+- [ ] Secure join procedure
